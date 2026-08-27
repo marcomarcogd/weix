@@ -54,6 +54,15 @@ class _WindowRef:
             else:
                 win32gui.ShowWindow(self.hwnd, win32con.SW_SHOW)
             win32gui.SetForegroundWindow(self.hwnd)
+
+            # 最小化窗口的旧坐标通常位于 (-32000, -32000)，恢复后必须
+            # 重新读取真实尺寸，避免后续可见性修正使用旧坐标缩小或误点窗口。
+            left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
+            if right > left and bottom > top:
+                self.left = left
+                self.top = top
+                self.width = right - left
+                self.height = bottom - top
         except Exception:
             # The caller has a click-based fallback after activation.
             pass
@@ -319,8 +328,6 @@ class WindowsSender(BaseMessageSender):
         matches: list[_WindowRef] = []
 
         def enum_handler(hwnd, _):
-            if not win32gui.IsWindowVisible(hwnd):
-                return
             title = (win32gui.GetWindowText(hwnd) or "").strip()
             if title not in WECHAT_WINDOW_TITLES:
                 return
@@ -334,7 +341,11 @@ class WindowsSender(BaseMessageSender):
             left, top, right, bottom = win32gui.GetWindowRect(hwnd)
             width = right - left
             height = bottom - top
-            if width < 400 or height < 300:
+            # Windows 会把最小化窗口放到 (-32000, -32000)，此时尺寸通常
+            # 只有约 160x28；关闭到托盘时主窗口则不可见但仍保留正常尺寸。
+            # 两者都是有效微信主窗口，真正发送前会自动恢复。
+            is_minimized = bool(win32gui.IsIconic(hwnd))
+            if not is_minimized and (width < 400 or height < 300):
                 return
             matches.append(
                 _WindowRef(

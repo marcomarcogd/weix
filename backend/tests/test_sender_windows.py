@@ -292,6 +292,106 @@ async def test_is_wechat_running_false():
     assert running is False
 
 
+def test_find_wechat_window_accepts_minimized_main_window():
+    """最小化微信仍应识别为在线，发送前再恢复窗口。"""
+    from app.core.sender_windows import WindowsSender
+
+    process = MagicMock()
+    process.name.return_value = "Weixin.exe"
+
+    def enum_windows(callback, extra):
+        callback(123, extra)
+
+    with (
+        patch("win32gui.EnumWindows", side_effect=enum_windows),
+        patch("win32gui.IsWindowVisible", return_value=True),
+        patch("win32gui.GetWindowText", return_value="微信"),
+        patch("win32gui.GetWindowRect", return_value=(-32000, -32000, -31840, -31972)),
+        patch("win32gui.IsIconic", return_value=True),
+        patch("win32process.GetWindowThreadProcessId", return_value=(1, 456)),
+        patch("psutil.Process", return_value=process),
+    ):
+        window = WindowsSender._find_wechat_window_win32()
+
+    assert window is not None
+    assert window.hwnd == 123
+    assert window.title == "微信"
+
+
+def test_find_wechat_window_accepts_hidden_tray_main_window():
+    """隐藏到托盘的微信主窗口仍应识别为在线。"""
+    from app.core.sender_windows import WindowsSender
+
+    process = MagicMock()
+    process.name.return_value = "Weixin.exe"
+
+    def enum_windows(callback, extra):
+        callback(123, extra)
+
+    with (
+        patch("win32gui.EnumWindows", side_effect=enum_windows),
+        patch("win32gui.IsWindowVisible", return_value=False),
+        patch("win32gui.GetWindowText", return_value="微信"),
+        patch("win32gui.GetWindowRect", return_value=(271, 170, 1104, 983)),
+        patch("win32gui.IsIconic", return_value=False),
+        patch("win32process.GetWindowThreadProcessId", return_value=(1, 456)),
+        patch("psutil.Process", return_value=process),
+    ):
+        window = WindowsSender._find_wechat_window_win32()
+
+    assert window is not None
+    assert window.hwnd == 123
+    assert window.title == "微信"
+
+
+def test_find_wechat_window_rejects_small_non_minimized_window():
+    """普通小工具窗口不能被误认成微信主窗口。"""
+    from app.core.sender_windows import WindowsSender
+
+    process = MagicMock()
+    process.name.return_value = "Weixin.exe"
+
+    def enum_windows(callback, extra):
+        callback(123, extra)
+
+    with (
+        patch("win32gui.EnumWindows", side_effect=enum_windows),
+        patch("win32gui.IsWindowVisible", return_value=True),
+        patch("win32gui.GetWindowText", return_value="微信"),
+        patch("win32gui.GetWindowRect", return_value=(100, 100, 260, 128)),
+        patch("win32gui.IsIconic", return_value=False),
+        patch("win32process.GetWindowThreadProcessId", return_value=(1, 456)),
+        patch("psutil.Process", return_value=process),
+    ):
+        window = WindowsSender._find_wechat_window_win32()
+
+    assert window is None
+
+
+def test_minimized_window_refreshes_geometry_after_restore():
+    """恢复最小化窗口后应使用新的屏幕坐标和尺寸。"""
+    from app.core.sender_windows import _WindowRef
+
+    window = _WindowRef(
+        left=-32000,
+        top=-32000,
+        width=160,
+        height=28,
+        title="微信",
+        hwnd=123,
+    )
+
+    with (
+        patch("win32gui.IsIconic", return_value=True),
+        patch("win32gui.ShowWindow", MagicMock()),
+        patch("win32gui.SetForegroundWindow", MagicMock()),
+        patch("win32gui.GetWindowRect", return_value=(100, 50, 1300, 850)),
+    ):
+        window.activate()
+
+    assert (window.left, window.top, window.width, window.height) == (100, 50, 1200, 800)
+
+
 def test_global_lock_serialization():
     """验证全局锁确保 GUI 操作串行。"""
     from app.core.sender_windows import WindowsSender
