@@ -8,11 +8,13 @@ import hashlib
 import hmac as hmac_mod
 import logging
 import os
+import re
 import sqlite3
 import struct
 import tempfile
 import threading
 import time
+from collections import Counter
 from datetime import datetime
 from typing import ClassVar, Optional
 
@@ -80,8 +82,10 @@ class WindowsDBReader(BaseDBReader):
         self._key_mode: str = ""
         self._lock = threading.Lock()
         self._msg_table_cache: Optional[list[tuple[str, str]]] = None
+        self._name2id_cache: Optional[dict[int, str]] = None
         self._last_refresh: float = 0
         self._current_sender_id: Optional[int] = None
+        self._direction_warning_logged: bool = False
 
     # --- 公共接口 ---
 
@@ -101,6 +105,16 @@ class WindowsDBReader(BaseDBReader):
             logger.error(f"数据库文件不存在: {db_path}")
             return False
 
+        # 同一个 reader 可能会依次尝试多个候选库。每次打开前必须清空
+        # 上一个数据库的表映射和身份推断，避免把另一台机器/另一账号的
+        # sender_id 缓存带到当前库。
+        if self._sqlite_conn is not None or self._decrypted_path:
+            self.close()
+        self._msg_table_cache = None
+        self._name2id_cache = None
+        self._current_sender_id = None
+        self._direction_warning_logged = False
+
         self._db_path = db_path
         self._key = key
 
@@ -117,6 +131,7 @@ class WindowsDBReader(BaseDBReader):
                 check_same_thread=False,
             )
             self._sqlite_conn.row_factory = sqlite3.Row
+            self._last_refresh = time.monotonic()
             logger.info("数据库打开成功")
             return True
         except Exception as exc:
@@ -146,6 +161,9 @@ class WindowsDBReader(BaseDBReader):
                 )
                 self._sqlite_conn.row_factory = sqlite3.Row
                 self._msg_table_cache = None
+                self._name2id_cache = None
+                self._current_sender_id = None
+                self._direction_warning_logged = False
                 self._last_refresh = time.monotonic()
             if old_conn:
                 try:
@@ -223,6 +241,11 @@ class WindowsDBReader(BaseDBReader):
                     except Exception:
                         content = str(content)
 
+                if is_group:
+                    sender_from_content = self._parse_group_sender_from_content(content)
+                    sender = sender_from_content or sender
+                    content = self._clean_group_content(content, sender)
+
                 msg = WeChatMessage(
                     msg_id=str(row["msg_id"] or ""),
                     msg_type=msg_type,
@@ -285,7 +308,8 @@ class WindowsDBReader(BaseDBReader):
                     is_group = "@chatroom" in username
                     sender = username
                     if is_group:
-                        sender = self._parse_group_sender(row["source"], username)
+                        sender = self._resolve_v4_group_sender(row, username)
+                        content = self._clean_group_content(content, sender)
 
                     messages.append(
                         WeChatMessage(
@@ -737,6 +761,10 @@ class WindowsDBReader(BaseDBReader):
         if self._sqlite_conn is None:
             return []
 
+        if self._get_current_sender_id() is None:
+            logger.warning("无法可靠识别当前账号，跳过本人消息风格提取")
+            return []
+
         since_ts = int(time.time()) - since_days * 86400
         messages: list[dict] = []
 
@@ -821,18 +849,61 @@ class WindowsDBReader(BaseDBReader):
         logger.info(f"Windows 4.x 消息表缓存已构建: {len(self._msg_table_cache)} 个会话表")
         return self._msg_table_cache
 
+    def _get_name2id_map(self) -> dict[int, str]:
+        """获取 Windows 4.x Name2Id.rowid 到 user_name 的映射。"""
+        if self._name2id_cache is not None:
+            return self._name2id_cache
+
+        self._name2id_cache = {}
+        if self._sqlite_conn is None:
+            return self._name2id_cache
+
+        try:
+            cursor = self._sqlite_conn.execute(
+                "SELECT rowid, user_name FROM Name2Id WHERE user_name IS NOT NULL"
+            )
+            for row in cursor:
+                user_name = str(row["user_name"] or "").strip()
+                if user_name:
+                    self._name2id_cache[int(row["rowid"])] = user_name
+        except Exception as exc:
+            logger.debug("读取 Name2Id 映射失败: %s", exc)
+
+        return self._name2id_cache
+
+    def _resolve_v4_group_sender(self, row, fallback: str) -> str:
+        """优先按 real_sender_id 解析群成员，失败时再检查 source。"""
+        try:
+            real_sender_id = int(row["real_sender_id"] or 0)
+        except (TypeError, ValueError, IndexError):
+            real_sender_id = 0
+
+        if real_sender_id:
+            sender = self._get_name2id_map().get(real_sender_id, "")
+            if sender:
+                return sender
+
+        return self._parse_group_sender(row["source"], fallback)
+
     def _is_self_sent_v4_row(self, row) -> bool:
         """识别当前账号自己发出的 Windows 4.x 消息。"""
         real_sender_id = row["real_sender_id"] or 0
         current_sender_id = self._get_current_sender_id()
-        if current_sender_id and real_sender_id == current_sender_id:
-            return True
-        if current_sender_id is None and real_sender_id == 1:
-            return True
         status = row["status"] or 0
         origin_source = row["origin_source"] or 0
         server_seq = row["server_seq"] or 0
-        return status == 2 and origin_source == 1 and server_seq == 0
+        if status == 2 and origin_source == 1 and server_seq == 0:
+            return True
+
+        if current_sender_id is not None and real_sender_id:
+            return real_sender_id == current_sender_id
+
+        # real_sender_id 缺失或当前账号无法可靠推断时采用安全失败：
+        # 宁可不回复，也不能把自己的已同步消息误判成对方消息。
+        if not self._direction_warning_logged:
+            logger.warning("消息方向证据不足，已安全阻止自动回复")
+            self._direction_warning_logged = True
+        return True
 
     def _get_current_sender_id(self) -> Optional[int]:
         """从 Name2Id 定位当前登录账号的 rowid。"""
@@ -842,26 +913,108 @@ class WindowsDBReader(BaseDBReader):
             return None
 
         current_wxid = self._normalize_current_wxid(self.get_current_wxid())
-        if not current_wxid:
+        if current_wxid:
+            try:
+                row = self._sqlite_conn.execute(
+                    "SELECT rowid FROM Name2Id WHERE user_name = ? LIMIT 1",
+                    (current_wxid,),
+                ).fetchone()
+                if row:
+                    self._current_sender_id = int(row["rowid"])
+                    logger.info(
+                        "Windows 当前账号 sender_id 已通过账号名识别: %s",
+                        self._current_sender_id,
+                    )
+                    return self._current_sender_id
+            except Exception as exc:
+                logger.debug("通过账号名识别 Windows sender_id 失败: %s", exc)
+
+        inferred = self._infer_current_sender_id()
+        if inferred is not None:
+            self._current_sender_id = inferred
+            logger.info(
+                "Windows 当前账号 sender_id 已通过本机发送记录识别: %s",
+                inferred,
+            )
+        return self._current_sender_id
+
+    def _infer_current_sender_id(self) -> Optional[int]:
+        """从跨会话本机发送特征与覆盖率推断当前账号 sender_id。"""
+        if self._sqlite_conn is None:
             return None
 
-        try:
-            row = self._sqlite_conn.execute(
-                "SELECT rowid FROM Name2Id WHERE user_name = ? LIMIT 1",
-                (current_wxid,),
-            ).fetchone()
-            if row:
-                self._current_sender_id = int(row["rowid"])
-                logger.debug(
-                    "Windows 当前账号 sender_id 已识别 | wxid=%s | rowid=%s",
-                    current_wxid,
-                    self._current_sender_id,
-                )
-                return self._current_sender_id
-        except Exception as exc:
-            logger.debug("识别 Windows 当前账号 sender_id 失败: %s", exc)
+        local_markers: Counter[int] = Counter()
+        private_coverage: Counter[int] = Counter()
+        private_table_count = 0
 
-        return None
+        for table, username in self._get_v4_msg_tables():
+            try:
+                marker_rows = self._sqlite_conn.execute(
+                    f'SELECT real_sender_id, COUNT(*) AS count FROM "{table}" '
+                    "WHERE real_sender_id > 0 AND status = 2 "
+                    "AND origin_source = 1 AND server_seq = 0 "
+                    "GROUP BY real_sender_id"
+                ).fetchall()
+                for marker in marker_rows:
+                    local_markers[int(marker["real_sender_id"])] += int(
+                        marker["count"]
+                    )
+
+                if username and "@chatroom" not in username:
+                    private_table_count += 1
+                    sender_rows = self._sqlite_conn.execute(
+                        f'SELECT DISTINCT real_sender_id FROM "{table}" '
+                        "WHERE real_sender_id > 0"
+                    ).fetchall()
+                    private_coverage.update(
+                        int(sender["real_sender_id"]) for sender in sender_rows
+                    )
+            except Exception:
+                continue
+
+        marker_candidate = self._dominant_sender_candidate(
+            local_markers,
+            minimum_count=3,
+            dominance_ratio=5,
+        )
+        # 仅靠“跨私聊会话覆盖率”时要求候选至少出现在一半已解析私聊表，
+        # 且显著领先第二名。数据较少或证据接近时宁可不自动回复。
+        coverage_candidate = self._dominant_sender_candidate(
+            private_coverage,
+            minimum_count=max(3, (private_table_count + 1) // 2),
+            dominance_ratio=3,
+        )
+
+        if (
+            marker_candidate is not None
+            and coverage_candidate is not None
+            and marker_candidate != coverage_candidate
+        ):
+            logger.warning(
+                "Windows 当前账号 sender_id 证据冲突，已禁用方向判定: "
+                "local_marker=%s, private_coverage=%s",
+                marker_candidate,
+                coverage_candidate,
+            )
+            return None
+
+        return marker_candidate or coverage_candidate
+
+    @staticmethod
+    def _dominant_sender_candidate(
+        counts: Counter[int],
+        *,
+        minimum_count: int,
+        dominance_ratio: int,
+    ) -> Optional[int]:
+        ranked = counts.most_common(2)
+        if not ranked or ranked[0][1] < minimum_count:
+            return None
+        top_id, top_count = ranked[0]
+        second_count = ranked[1][1] if len(ranked) > 1 else 0
+        if second_count and top_count < second_count * dominance_ratio:
+            return None
+        return int(top_id)
 
     @staticmethod
     def _normalize_current_wxid(wxid: str) -> str:
@@ -894,13 +1047,14 @@ class WindowsDBReader(BaseDBReader):
 
     @staticmethod
     def _parse_group_sender(source_blob, fallback: str) -> str:
-        if not source_blob or not isinstance(source_blob, bytes):
+        if not source_blob:
             return fallback
         try:
-            import re
-
-            text = source_blob.decode("utf-8", errors="replace")
-            match = re.search(r"wxid_[a-z0-9]+", text)
+            if isinstance(source_blob, bytes):
+                text = source_blob.decode("utf-8", errors="replace")
+            else:
+                text = str(source_blob)
+            match = re.search(r"(?:wxid|gh)_[a-z0-9_-]+", text, re.IGNORECASE)
             if match:
                 return match.group(0)
             match = re.search(r"\d+@openim", text)
@@ -909,6 +1063,39 @@ class WindowsDBReader(BaseDBReader):
         except Exception:
             pass
         return fallback
+
+    @staticmethod
+    def _parse_group_sender_from_content(content: str) -> str:
+        """从旧版群消息正文开头解析发送者 ID。"""
+        text = str(content or "")
+        match = re.match(
+            r"^\s*((?:wxid|gh)_[a-z0-9_-]+|\d+@openim)\s*:\s*(?:\r?\n|$)",
+            text,
+            re.IGNORECASE,
+        )
+        return match.group(1) if match else ""
+
+    @classmethod
+    def _clean_group_content(cls, content: str, sender: str = "") -> str:
+        """仅移除确认为发送者 ID 的群消息正文前缀。"""
+        text = str(content or "")
+        candidates = [str(sender or "").strip()]
+        parsed = cls._parse_group_sender_from_content(text)
+        if parsed:
+            candidates.append(parsed)
+
+        for candidate in candidates:
+            if not candidate:
+                continue
+            prefix = re.compile(
+                rf"^\s*{re.escape(candidate)}\s*:\s*(?:\r?\n|$)",
+                re.IGNORECASE,
+            )
+            cleaned, count = prefix.subn("", text, count=1)
+            if count:
+                return cleaned.strip()
+
+        return text.strip()
 
     @staticmethod
     def _derive_mac_key(enc_key: bytes, salt: bytes, hash_name: str = "sha512") -> bytes:
@@ -1264,15 +1451,22 @@ class WindowsDBReader(BaseDBReader):
                 )
                 is_group = "@chatroom" in username
                 for row in cursor:
+                    content = self._decode_message_content(row["message_content"])
+                    is_self = self._is_self_sent_v4_row(row)
+                    sender = username
+                    if is_group:
+                        sender = self._resolve_v4_group_sender(row, username)
+                        content = self._clean_group_content(content, sender)
                     messages.append(
                         WeChatMessage(
                             msg_id=f"{table}:{row['local_id']}",
                             msg_type=row["local_type"] or 0,
-                            content=self._decode_message_content(row["message_content"]),
-                            sender=username,
+                            content=content,
+                            sender=sender,
                             room_id=username if is_group else "",
                             create_time=datetime.fromtimestamp(row["create_time"] or 0),
                             is_group=is_group,
+                            is_self=is_self,
                             at_list=[],
                         )
                     )
@@ -1306,18 +1500,22 @@ class WindowsDBReader(BaseDBReader):
             )
             is_group = "@chatroom" in talker
             for row in cursor:
+                content = self._decode_message_content(row["message_content"])
+                is_self = self._is_self_sent_v4_row(row)
                 sender = talker
-                if is_group and not self._is_self_sent_v4_row(row):
-                    sender = self._parse_group_sender(row["source"], talker)
+                if is_group:
+                    sender = self._resolve_v4_group_sender(row, talker)
+                    content = self._clean_group_content(content, sender)
                 messages.append(
                     WeChatMessage(
                         msg_id=f"{table}:{row['local_id']}",
                         msg_type=row["local_type"] or 0,
-                        content=self._decode_message_content(row["message_content"]),
+                        content=content,
                         sender=sender,
                         room_id=talker if is_group else "",
                         create_time=datetime.fromtimestamp(row["create_time"] or 0),
                         is_group=is_group,
+                        is_self=is_self,
                         at_list=[],
                     )
                 )

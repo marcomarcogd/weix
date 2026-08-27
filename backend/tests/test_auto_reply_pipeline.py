@@ -12,7 +12,11 @@ from app.core.base import WeChatMessage
 
 
 class FakeRuleEngine:
+    def __init__(self):
+        self.calls = []
+
     async def match(self, content):
+        self.calls.append(content)
         return {"matched": True, "reply": "自动回复"}
 
 
@@ -54,11 +58,11 @@ class FakeAgent:
         return "好嘞\n\n我知道了 😄"
 
 
-def _group_msg(room_id="room@chatroom"):
+def _group_msg(room_id="room@chatroom", content="你好", msg_id="1"):
     return WeChatMessage(
-        msg_id="1",
+        msg_id=msg_id,
         msg_type=1,
-        content="你好",
+        content=content,
         sender=room_id,
         room_id=room_id,
         create_time=datetime.fromtimestamp(1778673000),
@@ -172,6 +176,46 @@ def test_open_message_db_uses_platform_specific_reader():
     assert reader.opened == [("C:/Users/me/MSG.db", bytes.fromhex("00" * 32))]
 
 
+def test_open_message_db_never_selects_windows_biz_message_database():
+    """公众号库即使含 Msg_% 表，也不能成为 Windows 自动回复的数据源。"""
+    class FakeReader:
+        def __init__(self):
+            self.opened = []
+
+        def find_database_files(self):
+            return [
+                "D:/xwechat/db_storage/message/biz_message_0.db",
+                "D:/xwechat/db_storage/message/message_0.db",
+            ]
+
+        def open_db(self, path, key):
+            self.opened.append((path, key))
+            return True
+
+        def is_message_db(self):
+            return True
+
+        def close(self):
+            pass
+
+    reader = FakeReader()
+    platform = SimpleNamespace(db_reader=reader, is_windows=True)
+    keys = {
+        "message/biz_message_0.db": "bb" * 32,
+        "message/message_0.db": "aa" * 32,
+    }
+
+    result = AutoReplyPipeline._open_message_db(platform, keys)
+
+    assert result is reader
+    assert reader.opened == [
+        (
+            "D:/xwechat/db_storage/message/message_0.db",
+            bytes.fromhex("aa" * 32),
+        )
+    ]
+
+
 @pytest.mark.asyncio
 async def test_handle_self_message_only_records_memory(monkeypatch):
     monkeypatch.setattr(
@@ -251,3 +295,224 @@ def test_clean_reply_for_wechat_removes_extra_spaces_newlines_and_emoji():
     text = AutoReplyPipeline._clean_reply_for_wechat("好 的\n\n我 知道 了  😄  ！")
 
     assert text == "好的我知道了！"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "@所有人 请注意",
+        "请大家 @所有人 看一下",
+        "通知结束 @所有人",
+        "wxid_member:\n@所有人\u2005请注意",
+    ],
+)
+@pytest.mark.asyncio
+async def test_group_reply_rule_matches_keyword_anywhere_with_custom_reply(
+    monkeypatch,
+    content,
+):
+    config = {
+        "reply_mode": "ai",
+        "group_reply_rules": [
+            {
+                "room_id": "room@chatroom",
+                "match_type": "contains",
+                "keyword": "@所有人",
+                "reply": "收到，自定义回复",
+                "rule_only": True,
+                "enabled": True,
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        "app.core.auto_reply_pipeline.get_config",
+        lambda: SimpleNamespace(auto_reply=config),
+    )
+
+    sender = FakeSender()
+    agent = FakeAgent()
+    rule_engine = FakeRuleEngine()
+    pipeline = AutoReplyPipeline()
+    pipeline._sender = sender
+    pipeline._ai_agent = agent
+    pipeline._rule_engine = rule_engine
+    pipeline._monitor = FakeMonitor()
+    pipeline._debounce_seconds = 0
+    pipeline._name_map = {"room@chatroom": "测试群"}
+    pipeline._buffer["room@chatroom"] = [
+        _group_msg(content=content),
+    ]
+
+    await pipeline._flush_buffer("room@chatroom")
+
+    assert sender.sent == [
+        (
+            "收到，自定义回复",
+            "测试群",
+            {
+                "is_group": True,
+                "force_skip": False,
+                "target_id": "room@chatroom",
+            },
+        )
+    ]
+    assert agent.chats == []
+    assert rule_engine.calls == []
+
+
+@pytest.mark.asyncio
+async def test_group_rule_only_miss_stays_silent_without_global_rule_or_ai(monkeypatch):
+    config = {
+        "reply_mode": "all",
+        "group_reply_rules": [
+            {
+                "room_id": "room@chatroom",
+                "match_type": "contains",
+                "keyword": "@所有人",
+                "reply": "1",
+                "rule_only": True,
+                "enabled": True,
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        "app.core.auto_reply_pipeline.get_config",
+        lambda: SimpleNamespace(auto_reply=config),
+    )
+
+    sender = FakeSender()
+    agent = FakeAgent()
+    rule_engine = FakeRuleEngine()
+    pipeline = AutoReplyPipeline()
+    pipeline._sender = sender
+    pipeline._ai_agent = agent
+    pipeline._rule_engine = rule_engine
+    pipeline._monitor = FakeMonitor()
+    pipeline._debounce_seconds = 0
+    pipeline._name_map = {"room@chatroom": "测试群"}
+    pipeline._buffer["room@chatroom"] = [
+        _group_msg(content="普通群消息"),
+    ]
+
+    await pipeline._flush_buffer("room@chatroom")
+
+    assert sender.sent == []
+    assert agent.chats == []
+    assert rule_engine.calls == []
+
+
+@pytest.mark.asyncio
+async def test_group_rule_batch_replies_only_once_and_other_group_keeps_ai(monkeypatch):
+    config = {
+        "reply_mode": "ai",
+        "group_reply_rules": [
+            {
+                "room_id": "room@chatroom",
+                "match_type": "contains",
+                "keyword": "@所有人",
+                "reply": "1",
+                "rule_only": True,
+                "enabled": True,
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        "app.core.auto_reply_pipeline.get_config",
+        lambda: SimpleNamespace(auto_reply=config),
+    )
+
+    sender = FakeSender()
+    agent = FakeAgent()
+    pipeline = AutoReplyPipeline()
+    pipeline._sender = sender
+    pipeline._ai_agent = agent
+    pipeline._monitor = FakeMonitor()
+    pipeline._debounce_seconds = 0
+    pipeline._name_map = {
+        "room@chatroom": "专属群",
+        "other@chatroom": "其他群",
+    }
+    pipeline._buffer["room@chatroom"] = [
+        _group_msg(content="@所有人 第一条", msg_id="1"),
+        _group_msg(content="第二条也有 @所有人", msg_id="2"),
+    ]
+
+    await pipeline._flush_buffer("room@chatroom")
+
+    assert [item[0] for item in sender.sent] == ["1"]
+    assert agent.chats == []
+
+    pipeline._buffer["other@chatroom"] = [
+        _group_msg(room_id="other@chatroom", content="普通消息", msg_id="3"),
+    ]
+    await pipeline._flush_buffer("other@chatroom")
+
+    assert [item[0] for item in sender.sent] == ["1", "好嘞我知道了"]
+    assert len(agent.chats) == 1
+
+
+@pytest.mark.asyncio
+async def test_windows_pipeline_does_not_repeat_sender_parking(monkeypatch):
+    from app.core.auto_reply_pipeline import Platform
+
+    monkeypatch.setattr(
+        Platform,
+        "get",
+        classmethod(lambda cls: SimpleNamespace(is_macos=False)),
+    )
+    pipeline = AutoReplyPipeline()
+    private_sender = FakeSender()
+    pipeline._private_sender = private_sender
+
+    await pipeline._park_after_reply()
+
+    assert pipeline._park_after_send is False
+    assert private_sender.opened == []
+
+
+def test_group_reply_rule_config_keeps_custom_reply_and_requires_whitelist():
+    from fastapi import HTTPException
+    from app.api.config import _normalize_group_reply_rules
+
+    rules = _normalize_group_reply_rules(
+        [
+            {
+                "room_id": "room@chatroom",
+                "match_type": "contains",
+                "keyword": "@所有人",
+                "reply": "自定义内容",
+                "rule_only": True,
+                "enabled": True,
+            }
+        ],
+        ["room@chatroom"],
+    )
+
+    assert rules[0]["reply"] == "自定义内容"
+    with pytest.raises(HTTPException):
+        _normalize_group_reply_rules(rules, [])
+
+
+def test_group_reply_rule_config_rejects_duplicate_enabled_room():
+    from fastapi import HTTPException
+    from app.api.config import _normalize_group_reply_rules
+
+    duplicate_rules = [
+        {
+            "room_id": "room@chatroom",
+            "match_type": "contains",
+            "keyword": "@所有人",
+            "reply": "1",
+            "enabled": True,
+        },
+        {
+            "room_id": "room@chatroom",
+            "match_type": "contains",
+            "keyword": "通知",
+            "reply": "收到",
+            "enabled": True,
+        },
+    ]
+
+    with pytest.raises(HTTPException):
+        _normalize_group_reply_rules(duplicate_rules, ["room@chatroom"])

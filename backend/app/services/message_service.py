@@ -39,6 +39,46 @@ class MessageService:
         await self.session.commit()
         return record
 
+    async def save_messages(self, messages: list[dict]) -> int:
+        """批量保存消息并按 msg_id 去重，只提交一次事务。"""
+        unique = {
+            str(msg.get("msg_id", "")): msg
+            for msg in messages
+            if msg.get("msg_id")
+        }
+        if not unique:
+            return 0
+
+        existing_ids: set[str] = set()
+        message_ids = list(unique)
+        for offset in range(0, len(message_ids), 500):
+            chunk = message_ids[offset:offset + 500]
+            result = await self.session.execute(
+                select(Message.msg_id).where(Message.msg_id.in_(chunk))
+            )
+            existing_ids.update(str(item) for item in result.scalars().all())
+
+        records = []
+        for msg_id, msg in unique.items():
+            if msg_id in existing_ids:
+                continue
+            records.append(Message(
+                msg_id=msg_id,
+                msg_type=msg.get("msg_type", 1),
+                content=msg.get("content", ""),
+                sender_wxid=msg.get("sender", ""),
+                sender_name=msg.get("sender_name", ""),
+                room_id=msg.get("room_id", ""),
+                room_name=msg.get("room_name", ""),
+                is_group=msg.get("is_group", False),
+                create_time=msg.get("create_time", datetime.now()),
+            ))
+
+        if records:
+            self.session.add_all(records)
+            await self.session.commit()
+        return len(records)
+
     async def get_messages(
         self, room_id: str = "", user_id: str = "", start_date: str = "", end_date: str = "",
         page: int = 1, size: int = 20,

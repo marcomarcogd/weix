@@ -162,6 +162,17 @@ class WindowsKeyExtractor(BaseKeyExtractor):
     WCDB_KEY_PATTERN = re.compile(rb"x'([0-9A-Fa-f]{64,192})'")
     V4_KEY_STUB_PATTERN = re.compile(rb".{6}\x00{2}\x00{8}\x20\x00{7}\x2f\x00{7}", re.S)
 
+    # WeChat 4.1+ runtime Config.Cipher layout/decoding is adapted from the
+    # MIT-licensed TANGandXUE/wcdb-key-tool project. See THIRD_PARTY_NOTICES.md.
+    CONFIG_CIPHER_NAME = b"com.Tencent.WCDB.Config.Cipher"
+    CONFIG_CIPHER_XOR_MASK = bytes.fromhex(
+        "d2c7442458020000004889442450488b"
+        "450048844c2448488944254048584c24"
+    )
+    CONFIG_CIPHER_LITERAL_PATTERN = re.compile(rb"[xX]'([0-9A-Fa-f]{64,192})'")
+    CONFIG_CIPHER_BLOB_MAX = 1024
+    MAX_USER_ADDRESS = 0x0000_8000_0000_0000
+
     # 数据库文件名模式
     DB_NAMES = [
         "MSG.db", "MicroMsg.db", "Misc.db", "Emotion.db",
@@ -383,13 +394,37 @@ class WindowsKeyExtractor(BaseKeyExtractor):
             hex_candidate_count = 0
             cancelled = False
 
-            wcdb_keys, wcdb_candidates, wcdb_cancelled = self._scan_wcdb_cached_keys(
-                h_process,
-                addresses,
-                salt_to_infos,
-                started_at,
-                stop_event,
+            config_keys, config_candidates, config_cancelled = (
+                self._scan_config_cipher_keys(
+                    h_process,
+                    addresses,
+                    salt_to_infos,
+                    started_at,
+                    stop_event,
+                )
             )
+            candidate_count += config_candidates
+            if config_keys:
+                found_keys.update(config_keys)
+                logger.info(
+                    "通过 WeChat 4.1 Config.Cipher 匹配到 %d 个数据库密钥",
+                    len(config_keys),
+                )
+            if config_cancelled:
+                logger.info("密钥扫描已取消")
+                return {}
+
+            wcdb_keys: dict[str, str] = {}
+            wcdb_candidates = 0
+            wcdb_cancelled = False
+            if not self._has_message_key(found_keys):
+                wcdb_keys, wcdb_candidates, wcdb_cancelled = self._scan_wcdb_cached_keys(
+                    h_process,
+                    addresses,
+                    salt_to_infos,
+                    started_at,
+                    stop_event,
+                )
             candidate_count += wcdb_candidates
             if wcdb_keys:
                 found_keys.update(wcdb_keys)
@@ -398,12 +433,14 @@ class WindowsKeyExtractor(BaseKeyExtractor):
                 logger.info("密钥扫描已取消")
                 return {}
 
-            v4_keys = self._collect_v4_binary_key_candidates(
-                h_process,
-                addresses,
-                started_at,
-                stop_event,
-            )
+            v4_keys: list[bytes] = []
+            if not self._has_message_key(found_keys):
+                v4_keys = self._collect_v4_binary_key_candidates(
+                    h_process,
+                    addresses,
+                    started_at,
+                    stop_event,
+                )
             if v4_keys:
                 candidate_count += len(v4_keys)
                 key_bytes = self._find_valid_v4_key(
@@ -489,6 +526,227 @@ class WindowsKeyExtractor(BaseKeyExtractor):
 
         finally:
             self._kernel32.CloseHandle(h_process)
+
+    def _scan_config_cipher_keys(
+        self,
+        h_process: int,
+        addresses: list[tuple[int, int]],
+        salt_to_infos: dict[str, list[dict[str, object]]],
+        started_at: float,
+        stop_event: Optional[threading.Event],
+    ) -> tuple[dict[str, str], int, bool]:
+        """Read and verify WeChat 4.1+ runtime Config.Cipher key material.
+
+        This path only uses ReadProcessMemory. It does not write process memory,
+        inject code, attach a debugger, or modify WeChat files.
+        """
+        found: dict[str, str] = {}
+        remaining_salts = set(salt_to_infos)
+        needle_addresses: set[int] = set()
+
+        for start_addr, region_size in addresses:
+            if stop_event is not None and stop_event.is_set():
+                return found, 0, True
+            if time.monotonic() - started_at > self.SCAN_TIMEOUT_SECONDS:
+                logger.warning(f"密钥扫描超时 ({self.SCAN_TIMEOUT_SECONDS}s)，提前停止")
+                return found, 0, False
+            try:
+                for chunk_addr, buffer in self._iter_region_chunks(
+                    h_process,
+                    start_addr,
+                    region_size,
+                ):
+                    if stop_event is not None and stop_event.is_set():
+                        return found, 0, True
+                    if time.monotonic() - started_at > self.SCAN_TIMEOUT_SECONDS:
+                        logger.warning(
+                            f"密钥扫描超时 ({self.SCAN_TIMEOUT_SECONDS}s)，提前停止"
+                        )
+                        return found, 0, False
+                    pos = buffer.find(self.CONFIG_CIPHER_NAME)
+                    while pos >= 0:
+                        needle_addresses.add(chunk_addr + pos)
+                        pos = buffer.find(self.CONFIG_CIPHER_NAME, pos + 1)
+            except Exception as exc:
+                logger.debug(f"扫描 Config.Cipher 名称失败: {exc}")
+
+        if not needle_addresses:
+            logger.info("未发现 WeChat 4.1 Config.Cipher 运行时对象")
+            return found, 0, False
+
+        pair_patterns = [
+            struct.pack("<Q", address)
+            + struct.pack("<Q", len(self.CONFIG_CIPHER_NAME))
+            for address in needle_addresses
+        ]
+        seen_nodes: set[int] = set()
+        seen_config_ptrs: set[int] = set()
+        seen_candidates: set[tuple[str, Optional[str]]] = set()
+        candidate_count = 0
+
+        for start_addr, region_size in addresses:
+            if not remaining_salts:
+                break
+            if stop_event is not None and stop_event.is_set():
+                return found, candidate_count, True
+            if time.monotonic() - started_at > self.SCAN_TIMEOUT_SECONDS:
+                logger.warning(f"密钥扫描超时 ({self.SCAN_TIMEOUT_SECONDS}s)，提前停止")
+                break
+            try:
+                chunks = self._iter_region_chunks(h_process, start_addr, region_size)
+                for chunk_addr, buffer in chunks:
+                    if stop_event is not None and stop_event.is_set():
+                        return found, candidate_count, True
+                    if time.monotonic() - started_at > self.SCAN_TIMEOUT_SECONDS:
+                        logger.warning(
+                            f"密钥扫描超时 ({self.SCAN_TIMEOUT_SECONDS}s)，提前停止"
+                        )
+                        return found, candidate_count, False
+                    for pattern in pair_patterns:
+                        pos = buffer.find(pattern)
+                        while pos >= 0:
+                            node_address = chunk_addr + pos - 0x10
+                            pos = buffer.find(pattern, pos + 1)
+                            if node_address in seen_nodes:
+                                continue
+                            seen_nodes.add(node_address)
+
+                            node = self._read_process_memory(h_process, node_address, 0x50)
+                            if not node or len(node) < 0x40:
+                                continue
+                            name_ptr = self._u64_from(node, 0x10)
+                            name_len = self._u64_from(node, 0x18)
+                            if (
+                                name_ptr not in needle_addresses
+                                or name_len != len(self.CONFIG_CIPHER_NAME)
+                            ):
+                                continue
+
+                            config_ptr = self._u64_from(node, 0x28)
+                            if not self._valid_user_pointer(config_ptr):
+                                continue
+                            seen_config_ptrs.add(config_ptr)
+
+                            obj = self._read_process_memory(
+                                h_process,
+                                config_ptr + 0x88,
+                                0x28,
+                            )
+                            if not obj or len(obj) < 0x18:
+                                continue
+                            data_ptr = self._u64_from(obj, 0x08)
+                            data_len = self._u64_from(obj, 0x10)
+                            if (
+                                not self._valid_user_pointer(data_ptr)
+                                or not 0 < data_len <= self.CONFIG_CIPHER_BLOB_MAX
+                            ):
+                                continue
+
+                            blob = self._read_process_memory(
+                                h_process,
+                                data_ptr,
+                                int(data_len),
+                            )
+                            if not blob or len(blob) != data_len:
+                                continue
+
+                            for enc_key_hex, embedded_salt in (
+                                self._config_cipher_key_candidates(blob)
+                            ):
+                                candidate = (enc_key_hex, embedded_salt)
+                                if candidate in seen_candidates:
+                                    continue
+                                seen_candidates.add(candidate)
+                                candidate_count += 1
+                                key = bytes.fromhex(enc_key_hex)
+                                target_salts = (
+                                    [embedded_salt]
+                                    if embedded_salt in remaining_salts
+                                    else list(remaining_salts)
+                                )
+                                for salt_hex in target_salts:
+                                    if salt_hex not in remaining_salts:
+                                        continue
+                                    infos = salt_to_infos[salt_hex]
+                                    if not any(
+                                        self._verify_direct_aes_key(key, info["page1"])  # type: ignore[arg-type]
+                                        for info in infos
+                                    ):
+                                        continue
+                                    for info in infos:
+                                        found[str(info["rel_path"])] = enc_key_hex.upper()
+                                    remaining_salts.discard(salt_hex)
+                                    logger.info(
+                                        "Config.Cipher 密钥验证成功: %s",
+                                        str(infos[0]["rel_path"]),
+                                    )
+            except Exception as exc:
+                logger.debug(f"扫描 Config.Cipher 对象失败: {exc}")
+
+        logger.info(
+            "Config.Cipher 扫描完成: 名称=%d, 对象=%d, 候选=%d, 有效=%d",
+            len(needle_addresses),
+            len(seen_config_ptrs),
+            candidate_count,
+            len(found),
+        )
+        return found, candidate_count, False
+
+    @classmethod
+    def _config_cipher_key_candidates(
+        cls,
+        blob: bytes,
+    ) -> list[tuple[str, Optional[str]]]:
+        if not blob or len(blob) > cls.CONFIG_CIPHER_BLOB_MAX:
+            return []
+        decoded = bytes(
+            value ^ cls.CONFIG_CIPHER_XOR_MASK[index % len(cls.CONFIG_CIPHER_XOR_MASK)]
+            for index, value in enumerate(blob)
+        )
+        candidates: list[tuple[str, Optional[str]]] = []
+        seen: set[tuple[str, Optional[str]]] = set()
+        for match in cls.CONFIG_CIPHER_LITERAL_PATTERN.finditer(decoded):
+            hex_run = match.group(1).decode("ascii").lower()
+            starts = [0]
+            if len(hex_run) > 96:
+                starts.extend(range(0, len(hex_run) - 63, 32))
+                starts.append(len(hex_run) - 64)
+            for start in dict.fromkeys(starts):
+                if start < 0 or start + 64 > len(hex_run):
+                    continue
+                key_hex = hex_run[start:start + 64]
+                try:
+                    key = bytes.fromhex(key_hex)
+                except ValueError:
+                    continue
+                if not cls._probable_config_cipher_key(key):
+                    continue
+                embedded_salt = None
+                if start + 96 <= len(hex_run):
+                    embedded_salt = hex_run[start + 64:start + 96]
+                item = (key_hex, embedded_salt)
+                if item not in seen:
+                    seen.add(item)
+                    candidates.append(item)
+        return candidates
+
+    @staticmethod
+    def _u64_from(data: bytes, offset: int) -> int:
+        if offset < 0 or offset + 8 > len(data):
+            return 0
+        return struct.unpack_from("<Q", data, offset)[0]
+
+    @staticmethod
+    def _valid_user_pointer(address: int) -> bool:
+        return 0x10000 <= address < WindowsKeyExtractor.MAX_USER_ADDRESS
+
+    @staticmethod
+    def _probable_config_cipher_key(key: bytes) -> bool:
+        return (
+            len(key) == 32
+            and len(set(key)) >= 15
+            and key not in {b"\x00" * 32, b"\xff" * 32}
+        )
 
     def _scan_wcdb_cached_keys(
         self,
@@ -878,10 +1136,9 @@ class WindowsKeyExtractor(BaseKeyExtractor):
                 scan_data = previous_tail + data
                 yield address + offset - len(previous_tail), scan_data
                 previous_tail = data[-self.SCAN_CHUNK_OVERLAP:]
-            if chunk_size <= self.SCAN_CHUNK_OVERLAP:
-                offset += chunk_size
             else:
-                offset += chunk_size - self.SCAN_CHUNK_OVERLAP
+                previous_tail = b""
+            offset += chunk_size
 
     def _read_process_memory(
         self, h_process: int, address: int, size: int

@@ -95,28 +95,38 @@ async def analyze_persona(force: bool = False):
         if not keys:
             return {"success": False, "error": "未获取数据库密钥，请以 sudo 启动服务"}
 
-        from app.core.db_reader_macos import MacOSDBReader
-
-        reader = MacOSDBReader()
+        # 使用当前平台对应的新 reader。不能复用流水线正在轮询的 reader，
+        # 否则分析结束时 close() 会把自动回复的共享连接一并关闭。
+        reader = platform.db_reader.__class__()
         all_dbs = reader.find_database_files()
 
         msg_db_path = None
         msg_key = None
         for full_path in all_dbs:
-            db_name = os.path.basename(full_path)
+            db_name = os.path.basename(full_path).lower()
+            if db_name != "message_0.db":
+                continue
             for key_path, hex_key in keys.items():
+                # biz_message_0.db 也包含字符串 "message_0.db"，但它是
+                # 公众号消息库，不能用于提取当前用户的聊天风格。
+                if os.path.basename(key_path).lower() != "message_0.db":
+                    continue
                 if _key_matches_db_path(key_path, full_path):
-                    if "message_0.db" in key_path or "message_0.db" in db_name:
-                        msg_db_path = full_path
-                        msg_key = hex_key
-                        break
+                    msg_db_path = full_path
+                    msg_key = hex_key
+                    break
             if msg_db_path:
                 break
 
         if not msg_db_path:
             return {"success": False, "error": "未找到消息数据库"}
 
-        reader.open_db(msg_db_path, bytes.fromhex(msg_key))
+        if not reader.open_db(msg_db_path, bytes.fromhex(msg_key)):
+            reader.close()
+            return {"success": False, "error": "消息数据库解密失败"}
+        if hasattr(reader, "is_message_db") and not reader.is_message_db():
+            reader.close()
+            return {"success": False, "error": "匹配的数据库不包含消息表"}
 
         # 2. 提取用户消息
         cfg = get_config()
@@ -125,8 +135,13 @@ async def analyze_persona(force: bool = False):
         since_days = int(ai_cfg.get("persona_since_days", 90))
         # limit=0 表示提取全部消息，传一个大值给 DB reader
         db_limit = message_limit if message_limit > 0 else 100000
-        raw_messages = reader.get_my_messages(limit=db_limit, since_days=since_days)
-        reader.close()
+        try:
+            raw_messages = reader.get_my_messages(
+                limit=db_limit,
+                since_days=since_days,
+            )
+        finally:
+            reader.close()
 
         if not raw_messages:
             return {"success": False, "error": "未提取到用户消息，请确认微信已登录"}

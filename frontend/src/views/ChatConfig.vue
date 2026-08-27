@@ -87,10 +87,10 @@ import { getChatConfig, updateChatConfig, getContacts, searchChatrooms, searchCo
 import { ElMessage } from 'element-plus'
 
 const form = reactive<any>({
-  enabled: true,
+  enabled: false,
   group_chat_mode: 'whitelist',
   group_whitelist: [],
-  private_chat_mode: 'all',
+  private_chat_mode: 'whitelist',
   private_whitelist: [],
   reply_mode: 'all',
 })

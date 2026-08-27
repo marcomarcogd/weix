@@ -165,6 +165,19 @@ async def test_open_chat_searches_without_sending():
             assert call_args[0][0] == "小号"
 
 
+def test_park_after_send_searches_file_transfer_assistant_once():
+    """Windows 发送器独占停靠动作，每次成功发送后只搜索一次。"""
+    sender = _make_sender()
+    sender._park_after_send = True
+    sender._parking_receiver = "文件传输助手"
+    sender._full_search = MagicMock()
+
+    sender._park_if_needed("测试群")
+
+    sender._full_search.assert_called_once_with("文件传输助手", is_group=False)
+    assert sender._last_receiver == "文件传输助手"
+
+
 def test_reset_search_state():
     """reset_search_state 清空免搜索状态。"""
     sender = _make_sender()
@@ -174,6 +187,89 @@ def test_reset_search_state():
     sender.reset_search_state()
     assert sender._last_receiver == ""
     assert sender._last_send_time == 0.0
+
+
+def test_unconfirmed_send_is_never_retried():
+    """数据库延迟时发送按钮只能点击一次，不能因未确认而补发。"""
+    sender = _make_sender()
+    _mock_window(sender)
+    sender._verify_after_send = True
+    sender._last_receiver = "测试联系人"
+    sender._last_send_time = time.monotonic()
+    sender._full_search = MagicMock()
+    sender._activate_wechat = MagicMock()
+    sender._focus_message_input = MagicMock(return_value=(10, 20))
+    sender._paste_text = MagicMock()
+    sender._click_send_button = MagicMock()
+    sender._verify_sent_text = MagicMock(return_value=False)
+
+    ok = sender._send_text_sync(
+        "只发一次",
+        "测试联系人",
+        force_skip=False,
+        is_group=False,
+        target_id="wxid_target",
+    )
+
+    assert ok is False
+    sender._click_send_button.assert_called_once_with()
+    sender._full_search.assert_not_called()
+    assert sender._last_receiver == ""
+
+
+def test_pre_send_skip_failure_falls_back_to_one_full_search():
+    """免搜索在点击发送前失败时，可以安全地完整搜索一次。"""
+    sender = _make_sender()
+    _mock_window(sender)
+    sender._last_receiver = "测试联系人"
+    sender._last_send_time = time.monotonic()
+    sender._full_search = MagicMock()
+    sender._activate_wechat = MagicMock()
+    sender._focus_message_input = MagicMock(
+        side_effect=[RuntimeError("输入框尚未就绪"), (10, 20)]
+    )
+    sender._paste_text = MagicMock()
+    sender._click_send_button = MagicMock()
+
+    ok = sender._send_text_sync(
+        "安全恢复",
+        "测试联系人",
+        force_skip=False,
+        is_group=False,
+        target_id="wxid_target",
+    )
+
+    assert ok is True
+    sender._full_search.assert_called_once_with("测试联系人", is_group=False)
+    sender._click_send_button.assert_called_once_with()
+
+
+def test_send_action_exception_is_never_retried():
+    """点击调用即使抛异常也视为可能已发送，禁止再次执行。"""
+    sender = _make_sender()
+    _mock_window(sender)
+    sender._last_receiver = "测试联系人"
+    sender._last_send_time = time.monotonic()
+    sender._full_search = MagicMock()
+    sender._activate_wechat = MagicMock()
+    sender._focus_message_input = MagicMock(return_value=(10, 20))
+    sender._paste_text = MagicMock()
+    sender._click_send_button = MagicMock(side_effect=RuntimeError("点击结果未知"))
+    sender._verify_sent_text = MagicMock()
+
+    ok = sender._send_text_sync(
+        "不能补发",
+        "测试联系人",
+        force_skip=False,
+        is_group=False,
+        target_id="wxid_target",
+    )
+
+    assert ok is False
+    sender._click_send_button.assert_called_once_with()
+    sender._verify_sent_text.assert_not_called()
+    sender._full_search.assert_not_called()
+    assert sender._last_receiver == ""
 
 
 @pytest.mark.asyncio
@@ -279,3 +375,89 @@ def test_reader_has_recent_self_text_requires_target_v4_table():
         )
         is True
     )
+
+
+def test_reader_has_recent_self_text_rejects_missing_target_id():
+    from app.core.sender_windows import WindowsSender
+
+    class Reader:
+        _sqlite_conn = object()
+
+        def _has_msg_shard_tables(self):
+            raise AssertionError("缺少目标会话时不应扫描任何消息表")
+
+    assert WindowsSender._reader_has_recent_self_text(Reader(), "消息", 1) is False
+
+
+def test_reader_has_recent_self_text_normalizes_group_prefix():
+    from app.core.sender_windows import WindowsSender
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE Msg_group (local_id INTEGER, create_time INTEGER, real_sender_id INTEGER, "
+        "message_content TEXT, local_type INTEGER, status INTEGER, origin_source INTEGER, server_seq INTEGER)"
+    )
+    conn.execute(
+        "INSERT INTO Msg_group VALUES (1, ?, 1, ?, 1, 3, 0, 10)",
+        (int(time.time()), "wxid_friend:\n收到\u200b"),
+    )
+
+    class Reader:
+        _sqlite_conn = conn
+
+        def _has_msg_shard_tables(self):
+            return True
+
+        def _get_v4_msg_tables(self):
+            return [("Msg_group", "room@chatroom")]
+
+        def _is_self_sent_v4_row(self, _row):
+            return True
+
+        def _decode_message_content(self, content):
+            return str(content or "")
+
+    assert WindowsSender._reader_has_recent_self_text(
+        Reader(),
+        "收到",
+        int(time.time()) - 2,
+        target_id="room@chatroom",
+    ) is True
+
+
+def test_reader_has_recent_self_text_rejects_future_timestamp():
+    from app.core.sender_windows import WindowsSender
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE Msg_group (local_id INTEGER, create_time INTEGER, real_sender_id INTEGER, "
+        "message_content TEXT, local_type INTEGER, status INTEGER, origin_source INTEGER, server_seq INTEGER)"
+    )
+    conn.execute(
+        "INSERT INTO Msg_group VALUES (1, ?, 1, '时间异常', 1, 3, 0, 10)",
+        (int(time.time()) + 3600,),
+    )
+
+    class Reader:
+        _sqlite_conn = conn
+
+        def _has_msg_shard_tables(self):
+            return True
+
+        def _get_v4_msg_tables(self):
+            return [("Msg_group", "room@chatroom")]
+
+        def _is_self_sent_v4_row(self, _row):
+            return True
+
+        def _decode_message_content(self, content):
+            return str(content or "")
+
+    assert WindowsSender._reader_has_recent_self_text(
+        Reader(),
+        "时间异常",
+        int(time.time()) - 2,
+        target_id="room@chatroom",
+    ) is False

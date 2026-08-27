@@ -55,7 +55,7 @@ def test_should_process_keeps_self_message_for_memory(monkeypatch):
     assert monitor._stats.self_skipped == 1
 
 
-def test_should_process_skips_private_not_in_whitelist(monkeypatch):
+def test_should_process_keeps_private_for_local_statistics(monkeypatch):
     monkeypatch.setattr(
         "app.core.message_monitor.get_config",
         lambda: SimpleNamespace(
@@ -67,7 +67,7 @@ def test_should_process_skips_private_not_in_whitelist(monkeypatch):
         ),
     )
 
-    assert _monitor()._should_process(_msg("wxid_blocked")) is False
+    assert _monitor()._should_process(_msg("wxid_blocked")) is True
 
 
 def test_should_process_keeps_private_in_whitelist(monkeypatch):
@@ -85,7 +85,7 @@ def test_should_process_keeps_private_in_whitelist(monkeypatch):
     assert _monitor()._should_process(_msg("wxid_allowed")) is True
 
 
-def test_should_process_skips_group_not_in_whitelist(monkeypatch):
+def test_should_process_keeps_group_for_local_statistics(monkeypatch):
     monkeypatch.setattr(
         "app.core.message_monitor.get_config",
         lambda: SimpleNamespace(
@@ -99,7 +99,7 @@ def test_should_process_skips_group_not_in_whitelist(monkeypatch):
 
     msg = _msg("member_wxid", room_id="blocked@chatroom", is_group=True)
 
-    assert _monitor()._should_process(msg) is False
+    assert _monitor()._should_process(msg) is True
 
 
 def test_should_process_skips_recent_bot_sent_message(monkeypatch):

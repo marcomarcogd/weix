@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import re
+from datetime import datetime, time as datetime_time
 from typing import Optional
 
 from app.config import get_config
@@ -66,9 +67,10 @@ class AutoReplyPipeline:
             self._park_after_send = sender_cfg.get("park_after_send", True)
             self._parking_receiver = sender_cfg.get("parking_receiver", "小号")
         else:
-            sender_cfg = get_config().windows_sender if hasattr(get_config(), "windows_sender") else {}
-            self._park_after_send = sender_cfg.get("park_after_send", False)
-            self._parking_receiver = sender_cfg.get("parking_receiver", "")
+            # WindowsSender 在发送成功并通过数据库回读校验后自行完成停靠。
+            # 流水线不能再次 open_chat，否则每次回复会重复搜索停靠联系人。
+            self._park_after_send = False
+            self._parking_receiver = ""
 
     # ------------------------------------------------------------------
     # Public API
@@ -104,18 +106,21 @@ class AutoReplyPipeline:
         # 3. 构建名称映射 (wxid -> 显示名，用于 AppleScript 搜索)
         self._name_map = self._build_name_map(platform, keys)
 
-        # 4. 启动消息监控
-        self._monitor = MessageMonitor(msg_reader)
-        await self._monitor.start()
+        # 4. 仅回填今天的本地统计，不进入自动回复队列。
+        await self._backfill_today_messages(msg_reader)
 
-        # 5. 加载规则引擎 (先从 YAML 同步到 DB)
+        # 5. 启动消息监控。回看 5 分钟，避免启动/重启过程漏掉刚收到的消息。
+        self._monitor = MessageMonitor(msg_reader)
+        await self._monitor.start(lookback_seconds=300.0)
+
+        # 6. 加载规则引擎 (先从 YAML 同步到 DB)
         from app.workflow.rule_engine import RuleEngine
 
         await self._seed_rules_from_yaml()
         self._rule_engine = RuleEngine(session_factory=self._session_factory)
         await self._rule_engine.load_rules()
 
-        # 6. 加载工作流引擎 (支持 legacy / langgraph 切换)
+        # 7. 加载工作流引擎 (支持 legacy / langgraph 切换)
         wf_engine_type = get_config().workflow_engine
 
         if wf_engine_type == "langgraph":
@@ -133,7 +138,7 @@ class AutoReplyPipeline:
 
         await self._workflow_engine.load_workflows()
 
-        # 7. 启动后台处理循环
+        # 8. 启动后台处理循环
         self._running = True
         self._task = asyncio.create_task(self._process_loop())
         logger.info("自动回复流水线已启动")
@@ -184,8 +189,8 @@ class AutoReplyPipeline:
     def _open_message_db(platform, keys: dict[str, str]):
         """打开消息数据库并返回 reader。
 
-        按优先级收集候选文件（message_0.db > MSG.db > 其他），逐个尝试
-        打开并验证是否为真正的消息数据库（包含 Msg_% 表）。
+        按优先级收集候选文件（message_0.db > MSG.db），逐个尝试打开。
+        Windows 不允许回退到 biz_message_0.db 等同样含 Msg_% 表的业务库。
         """
         reader = platform.db_reader
 
@@ -201,31 +206,39 @@ class AutoReplyPipeline:
         )
         logger.info(f"可用密钥: {list(keys.keys())}")
 
-        # 按优先级构建候选列表: message_0.db > MSG.db > 其他匹配
+        # 按优先级构建候选列表: message_0.db > MSG.db。
+        # macOS 保留旧版其他消息库兜底；Windows 4.x 必须精确选库。
         candidates: list[tuple[str, str]] = []  # (path, hex_key)
-        fallback: list[tuple[str, str]] = []
+        legacy_candidates: list[tuple[str, str]] = []
+        other_fallback: list[tuple[str, str]] = []
 
         for full_path in all_dbs:
             basename = os.path.basename(full_path)
+            basename_lower = basename.lower()
             for key_path, hex_key in keys.items():
                 key_name = os.path.basename(key_path)
+                key_name_lower = key_name.lower()
                 if not _key_matches_db_path(key_path, full_path):
                     continue
-                if key_name == "message_0.db" or basename == "message_0.db":
+                pair = (full_path, hex_key)
+                if (
+                    key_name_lower == "message_0.db"
+                    and basename_lower == "message_0.db"
+                ):
                     candidates.append((full_path, hex_key))
-                elif key_name == "MSG.db" or basename == "MSG.db":
-                    fallback.append((full_path, hex_key))
-                else:
-                    # 其他匹配 key 的文件作为最后兜底
-                    if not any(f == full_path for f, _ in candidates + fallback):
-                        fallback.append((full_path, hex_key))
+                elif key_name_lower == "msg.db" and basename_lower == "msg.db":
+                    legacy_candidates.append(pair)
+                elif not getattr(platform, "is_windows", False):
+                    # macOS 旧版存在不同消息库命名，保留平台限定兜底。
+                    if pair not in other_fallback:
+                        other_fallback.append(pair)
 
-        all_candidates = candidates + fallback
+        all_candidates = candidates + legacy_candidates + other_fallback
 
         logger.info(
             f"候选数据库: message_0={len(candidates)} 个, "
-            f"MSG={len([f for f,_ in fallback if 'MSG.db' in os.path.basename(f)])} 个, "
-            f"其他={len(fallback)} 个"
+            f"MSG={len(legacy_candidates)} 个, "
+            f"其他={len(other_fallback)} 个"
         )
 
         if not all_candidates:
@@ -420,7 +433,7 @@ class AutoReplyPipeline:
                 logger.error(f"处理消息异常: {exc}", exc_info=True)
 
     async def _handle_message(self, msg) -> None:
-        """消息入口：白名单检查通过后进入防抖缓冲，20s 内同人消息合并处理。"""
+        """先持久化用于统计，再按开关和白名单决定是否自动回复。"""
         logger.info(
             f">>> 收到消息 | sender={msg.sender} | is_group={msg.is_group} | "
             f"is_self={getattr(msg, 'is_self', False)} | "
@@ -428,14 +441,19 @@ class AutoReplyPipeline:
         )
         config = get_config().auto_reply
 
-        if not config.get("enabled", True):
-            return
-
         if msg.is_group:
             receiver = msg.room_id or msg.sender
         else:
             receiver = msg.sender
         buffer_key = receiver
+
+        # 首页统计独立于自动回复权限。禁用或不在白名单的消息也只读记录，
+        # 但不会进入 AI、规则或发送链路。
+        await self._persist_message(msg)
+
+        if not config.get("enabled", False):
+            logger.debug("自动回复未启用，仅记录消息 | receiver=%s", receiver)
+            return
 
         if not msg.is_group:
             mode = config.get("private_chat_mode", "whitelist")
@@ -474,8 +492,7 @@ class AutoReplyPipeline:
                 f"in_whitelist={msg.room_id in config.get('group_whitelist', [])}"
             )
 
-        # 持久化和短期上下文记录先发生；自发消息只记忆，不进入自动回复队列。
-        await self._persist_message(msg)
+        # 只有通过自动回复权限的会话才进入短期上下文和 AI 记忆。
         self._remember_message_context(msg)
 
         if getattr(msg, "is_self", False):
@@ -549,9 +566,46 @@ class AutoReplyPipeline:
         config = get_config().auto_reply
         reply_mode = config.get("reply_mode", "all")
         reply_text = ""
+        group_rule = (
+            self._find_group_reply_rule(config, receiver)
+            if msg.is_group
+            else None
+        )
+        group_rule_only = bool(group_rule and group_rule.get("rule_only", True))
+
+        # 群聊专属规则优先于全局规则和 AI。包含匹配直接针对原始消息文本，
+        # 因此不受 Windows 群消息中的发送者前缀或关键词位置影响。
+        if group_rule:
+            supported_match = (
+                str(group_rule.get("match_type", "contains")).lower()
+                == "contains"
+            )
+            keyword = str(group_rule.get("keyword", "")).casefold()
+            matched = supported_match and bool(keyword) and any(
+                keyword in str(item.content or "").casefold()
+                for item in reply_messages
+            )
+            if matched:
+                reply_text = str(group_rule.get("reply", "")).strip()
+                logger.info(
+                    "群聊专属规则命中 | room=%s | keyword=%s",
+                    receiver,
+                    group_rule.get("keyword", ""),
+                )
+            elif group_rule_only:
+                logger.debug(
+                    "群聊专属规则未命中且禁止兜底，保持静默 | room=%s",
+                    receiver,
+                )
+                return
 
         # 1. 规则匹配（逐条匹配，取第一条命中）
-        if reply_mode in ("keyword", "all") and self._rule_engine:
+        if (
+            not reply_text
+            and not group_rule_only
+            and reply_mode in ("keyword", "all")
+            and self._rule_engine
+        ):
             for m in reply_messages:
                 result = await self._rule_engine.match(m.content)
                 if result.get("matched"):
@@ -562,7 +616,11 @@ class AutoReplyPipeline:
                     break
 
         # 2. AI 兜底（用合并内容调用）
-        if not reply_text and reply_mode in ("ai", "all"):
+        if (
+            not reply_text
+            and not group_rule_only
+            and reply_mode in ("ai", "all")
+        ):
             ai_msg = reply_messages[0]
             ai_msg.content = combined
             reply_text = await self._ai_chat(ai_msg)
@@ -603,6 +661,25 @@ class AutoReplyPipeline:
                     display_name,
                     msg.is_group,
                 )
+
+    @staticmethod
+    def _find_group_reply_rule(config: dict, room_id: str) -> Optional[dict]:
+        """返回指定群当前启用的专属规则；未配置时返回 None。"""
+        rules = config.get("group_reply_rules", [])
+        if not isinstance(rules, list):
+            return None
+        for rule in rules:
+            if not isinstance(rule, dict) or not rule.get("enabled", True):
+                continue
+            if str(rule.get("room_id", "")) != str(room_id):
+                continue
+            if str(rule.get("match_type", "contains")).lower() != "contains":
+                logger.warning(
+                    "群聊专属规则匹配类型不受支持，已保持静默 | room=%s",
+                    room_id,
+                )
+            return rule
+        return None
 
     @staticmethod
     def _is_unsearchable_name(name: str) -> bool:
@@ -655,6 +732,48 @@ class AutoReplyPipeline:
                 })
         except Exception as exc:
             logger.error(f"持久化消息失败: {exc}")
+
+    async def _backfill_today_messages(self, reader) -> None:
+        """将今天的微信文本消息回填到本地统计，不触发任何自动回复。"""
+        if self._session_factory is None:
+            return
+
+        midnight = datetime.combine(datetime.now().date(), datetime_time.min)
+        try:
+            messages = await asyncio.to_thread(
+                reader.query_messages_since,
+                int(midnight.timestamp()),
+            )
+            if not messages:
+                return
+
+            from app.services.message_service import MessageService
+
+            payloads = [
+                {
+                    "msg_id": msg.msg_id,
+                    "msg_type": msg.msg_type,
+                    "content": msg.content or "",
+                    "sender": msg.sender,
+                    "sender_name": self._name_map.get(msg.sender, ""),
+                    "room_id": msg.room_id or "",
+                    "room_name": (
+                        self._name_map.get(msg.room_id, "") if msg.room_id else ""
+                    ),
+                    "is_group": msg.is_group,
+                    "create_time": msg.create_time,
+                }
+                for msg in messages
+            ]
+            async with self._session_factory() as session:
+                inserted = await MessageService(session).save_messages(payloads)
+            logger.info(
+                "今日消息统计已回填: 扫描=%d, 新增=%d",
+                len(messages),
+                inserted,
+            )
+        except Exception as exc:
+            logger.warning("回填今日消息统计失败: %s", exc)
 
 
     def _remember_message_context(self, msg) -> None:

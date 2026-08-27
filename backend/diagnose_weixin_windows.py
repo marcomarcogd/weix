@@ -41,6 +41,22 @@ def _mask(hex_value: str) -> str:
     return f"{hex_value[:8]}...{hex_value[-8:]}"
 
 
+def _is_message_db_rel_path(value: object) -> bool:
+    """识别账号目录前缀可变的 Windows 4.x 主消息数据库路径。"""
+    normalized = str(value or "").replace("\\", "/").lower().strip("/")
+    return normalized == "message/message_0.db" or normalized.endswith(
+        "/message/message_0.db"
+    )
+
+
+def _find_message_key(keys: dict[str, str]) -> str | None:
+    """从扫描结果中查找主消息库密钥，兼容嵌套相对路径。"""
+    return next(
+        (value for path, value in keys.items() if _is_message_db_rel_path(path)),
+        None,
+    )
+
+
 def _print_key_info_files() -> None:
     appdata = os.getenv("APPDATA", "")
     login_dir = Path(appdata) / "Tencent" / "xwechat" / "login" if appdata else None
@@ -134,8 +150,7 @@ def _run_diagnosis() -> int:
         (
             info
             for info in db_infos
-            if str(info["rel_path"]).replace("\\", "/").lower()
-            == "message/message_0.db"
+            if _is_message_db_rel_path(info["rel_path"])
         ),
         None,
     )
@@ -151,7 +166,7 @@ def _run_diagnosis() -> int:
     print("scan_key_count:", len(keys))
     print("scan_key_paths:", sorted(keys))
 
-    result_key = keys.get("message/message_0.db")
+    result_key = _find_message_key(keys)
     if not result_key:
         print("scan_message_key: False")
         print("result: no_message_key")

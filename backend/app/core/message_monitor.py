@@ -277,8 +277,6 @@ class MessageMonitor:
             return False
 
         if getattr(msg, "is_self", False):
-            if not self._passes_chat_acl(msg):
-                return False
             self._stats.self_skipped += 1
             logger.debug(
                 "当前账号自己发送的消息入记忆通道 | sender=%s | room=%s | content=%s",
@@ -294,9 +292,6 @@ class MessageMonitor:
                 msg.room_id if msg.is_group else msg.sender,
                 msg.content[:50],
             )
-            return False
-
-        if not self._passes_chat_acl(msg):
             return False
 
         return True
@@ -327,31 +322,6 @@ class MessageMonitor:
     def _normalize_content(content: str) -> str:
         """统一消息文本用于去重匹配。"""
         return str(content or "").strip()
-
-    @staticmethod
-    def _passes_chat_acl(msg: WeChatMessage) -> bool:
-        """入队前按聊天权限过滤，避免非目标消息污染自动回复队列。"""
-        config = get_config().auto_reply
-        if not config.get("enabled", True):
-            return False
-
-        if msg.is_group:
-            mode = config.get("group_chat_mode", "whitelist")
-            if mode == "none":
-                return False
-            if mode == "whitelist":
-                whitelist = config.get("group_whitelist", [])
-                room_id = msg.room_id or msg.sender
-                return room_id in whitelist or str(room_id) in whitelist
-            return True
-
-        mode = config.get("private_chat_mode", "whitelist")
-        if mode == "none":
-            return False
-        if mode == "whitelist":
-            whitelist = config.get("private_whitelist", [])
-            return msg.sender in whitelist or str(msg.sender) in whitelist
-        return True
 
     def _cleanup_dedup(self) -> None:
         """清理过期的去重记录。"""

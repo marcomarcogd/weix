@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -102,7 +103,9 @@ class WindowsSender(BaseMessageSender):
         self._verify_timeout = float(win_cfg.get("verify_timeout", 30.0))
         self._verify_interval = float(win_cfg.get("verify_interval", 1.0))
         self._park_after_send = bool(win_cfg.get("park_after_send", False))
-        self._parking_receiver = str(win_cfg.get("parking_receiver", "") or "")
+        self._parking_receiver = str(
+            win_cfg.get("parking_receiver", "文件传输助手") or ""
+        )
 
         self._last_receiver = ""
         self._last_send_time: float = 0.0
@@ -195,58 +198,74 @@ class WindowsSender(BaseMessageSender):
     ) -> bool:
         """同步消息发送，在全局锁内执行。"""
         with self._gui_lock:
-            try:
-                # 检查微信是否在运行
-                if self._find_wechat_window() is None:
-                    logger.error("未找到微信窗口")
-                    return False
+            skip_search = self._should_skip_search(receiver, force_skip, is_group)
 
-                # 判断是否跳过搜索
-                skip_search = self._should_skip_search(receiver, force_skip, is_group)
+            while True:
+                send_action_attempted = False
+                try:
+                    # 检查微信是否在运行
+                    if self._find_wechat_window() is None:
+                        logger.error("未找到微信窗口")
+                        return False
 
-                if not skip_search:
-                    self._full_search(receiver, is_group=is_group)
-                else:
-                    logger.info("免搜索发送 | receiver=%s", receiver)
+                    if not skip_search:
+                        self._full_search(receiver, is_group=is_group)
+                    else:
+                        logger.info("免搜索发送 | receiver=%s", receiver)
 
-                send_started_at = int(time.time()) - 2
+                    send_started_at = int(time.time()) - 2
 
-                # 聚焦输入框 + 粘贴消息 + 点击发送；不使用键盘快捷键。
-                self._activate_wechat()
-                input_x, input_y = self._focus_message_input()
-                self._paste_text(msg, input_x, input_y)
-                self._click_send_button()
+                    # 聚焦输入框 + 粘贴消息 + 点击发送；不使用键盘快捷键。
+                    self._activate_wechat()
+                    input_x, input_y = self._focus_message_input()
+                    self._paste_text(msg, input_x, input_y)
 
-                if not self._verify_sent_text(msg, send_started_at, target_id):
-                    logger.error(
-                        "消息发送后未在目标会话数据库中确认 | receiver=%s | target_id=%s",
-                        receiver,
-                        target_id,
-                    )
-                    return False
+                    # 点击本身可能已经生效后才抛异常，所以必须在调用前标记。
+                    # 从这一刻开始禁止任何自动补发，避免数据库写入延迟导致重复消息。
+                    send_action_attempted = True
+                    self._click_send_button()
 
-                self._remember_current_chat(receiver)
-                self._park_if_needed(receiver)
+                    if not self._verify_sent_text(msg, send_started_at, target_id):
+                        logger.error(
+                            "发送动作已执行但数据库回读未确认；为避免重复发送已停止补发 "
+                            "| receiver=%s | target_id=%s",
+                            receiver,
+                            target_id,
+                        )
+                        self.reset_search_state()
+                        return False
 
-                logger.info("消息发送成功 | receiver=%s", receiver)
-                return True
+                    self._remember_current_chat(receiver)
+                    self._park_if_needed(receiver)
 
-            except Exception as exc:
-                logger.error("消息发送失败: %s", exc)
+                    logger.info("消息发送成功 | receiver=%s", receiver)
+                    return True
 
-                # 免搜索失败时重试完整搜索
-                if skip_search and not force_skip:
-                    logger.info("免搜索失败，重试完整搜索")
+                except Exception as exc:
                     self.reset_search_state()
-                    return self._send_text_sync(
-                        msg,
-                        receiver,
-                        force_skip=False,
-                        is_group=is_group,
-                        target_id=target_id,
-                    )
+                    if send_action_attempted:
+                        logger.error(
+                            "发送动作可能已经执行，已禁止自动重试 "
+                            "| receiver=%s | target_id=%s | error=%s",
+                            receiver,
+                            target_id,
+                            exc,
+                        )
+                        return False
 
-                return False
+                    # 仅在尚未执行发送动作时，允许免搜索路径切换为一次完整搜索。
+                    if skip_search and not force_skip:
+                        logger.warning(
+                            "免搜索在发送前失败，改用一次完整搜索 "
+                            "| receiver=%s | error=%s",
+                            receiver,
+                            exc,
+                        )
+                        skip_search = False
+                        continue
+
+                    logger.error("消息发送前失败 | receiver=%s | error=%s", receiver, exc)
+                    return False
 
     def _open_chat_sync(self, receiver: str) -> bool:
         """同步打开聊天。"""
@@ -546,6 +565,9 @@ class WindowsSender(BaseMessageSender):
         """发送后从本地消息库回读确认，避免 GUI 假阳性。"""
         if not self._verify_after_send:
             return True
+        if not target_id:
+            logger.warning("发送回读校验缺少目标会话 ID，已拒绝跨会话匹配")
+            return False
 
         deadline = time.monotonic() + self._verify_timeout
         while time.monotonic() <= deadline:
@@ -618,6 +640,11 @@ class WindowsSender(BaseMessageSender):
         normalized_msg = WindowsSender._normalize_text(msg)
         if not normalized_msg or reader._sqlite_conn is None:
             return False
+        if not target_id:
+            logger.warning("拒绝缺少 target_id 的发送回读校验")
+            return False
+
+        until_ts = int(time.time()) + 5
 
         if reader._has_msg_shard_tables():
             tables = [
@@ -634,9 +661,10 @@ class WindowsSender(BaseMessageSender):
                         f'SELECT message_content, real_sender_id, status, '
                         f'origin_source, server_seq '
                         f'FROM "{table}" '
-                        f'WHERE create_time >= ? AND local_type = 1 '
+                        f'WHERE create_time >= ? AND create_time <= ? '
+                        f'AND local_type = 1 '
                         f'ORDER BY local_id DESC LIMIT 20',
-                        (since_ts,),
+                        (since_ts, until_ts),
                     )
                 except Exception:
                     continue
@@ -649,7 +677,7 @@ class WindowsSender(BaseMessageSender):
             return False
 
         try:
-            params: list[object] = [since_ts * 1000]
+            params: list[object] = [since_ts * 1000, until_ts * 1000]
             talker_filter = ""
             if target_id:
                 talker_filter = "AND msg_talker = ?"
@@ -659,6 +687,7 @@ class WindowsSender(BaseMessageSender):
                 SELECT msg_content
                 FROM MSG
                 WHERE msg_create_time >= ?
+                  AND msg_create_time <= ?
                   AND msg_type = 1
                   AND is_sender = 1
                   {talker_filter}
@@ -676,7 +705,20 @@ class WindowsSender(BaseMessageSender):
 
     @staticmethod
     def _normalize_text(text: str) -> str:
-        return str(text or "").replace("\r\n", "\n").strip()
+        normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+        normalized = re.sub(
+            r"^\s*(?:(?:wxid|gh)_[a-z0-9_-]+|\d+@openim)\s*:\s*(?:\n|$)",
+            "",
+            normalized,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        normalized = "".join(
+            character
+            for character in normalized
+            if character not in "\u200b\u200c\u200d\ufeff"
+        )
+        return " ".join(normalized.split())
 
     # --- 内部判断 ---
 

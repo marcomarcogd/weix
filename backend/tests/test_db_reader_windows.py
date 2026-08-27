@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app.core.db_reader_windows import WindowsDBReader
 from app.core.wechat_paths_windows import WeChatDataDir, find_wechat_data_dirs
+from diagnose_weixin_windows import _find_message_key, _is_message_db_rel_path
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows 专属测试")
@@ -120,3 +121,210 @@ def test_windows_v4_self_sent_fallback_keeps_local_send_signature():
     ).fetchone()
 
     assert reader._is_self_sent_v4_row(local_send_row) is True
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "message/message_0.db",
+        "account_a/message/message_0.db",
+        r"account_b\message\message_0.db",
+    ],
+)
+def test_diagnose_recognizes_nested_windows_v4_message_db(path):
+    assert _is_message_db_rel_path(path) is True
+
+
+def test_diagnose_finds_nested_windows_v4_message_key():
+    keys = {
+        "account_a/contact/contact.db": "CONTACT_KEY",
+        "account_a/message/message_0.db": "MESSAGE_KEY",
+    }
+
+    assert _find_message_key(keys) == "MESSAGE_KEY"
+
+
+def test_windows_v4_group_sender_uses_name2id_rowid_and_cleans_prefix():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE Name2Id (user_name TEXT)")
+    conn.execute("INSERT INTO Name2Id (rowid, user_name) VALUES (1, 'wxid_me')")
+    conn.execute("INSERT INTO Name2Id (rowid, user_name) VALUES (7, 'wxid_friend')")
+
+    reader = WindowsDBReader()
+    reader._sqlite_conn = conn
+    row = conn.execute(
+        "SELECT 7 AS real_sender_id, ? AS source",
+        (b"unrelated protobuf bytes",),
+    ).fetchone()
+
+    sender = reader._resolve_v4_group_sender(row, "room@chatroom")
+    content = reader._clean_group_content("wxid_friend:\n收到", sender)
+
+    assert sender == "wxid_friend"
+    assert content == "收到"
+
+    reader.close()
+
+
+def test_windows_group_content_prefix_fallback_does_not_use_room_id_as_sender():
+    reader = WindowsDBReader()
+
+    sender = reader._parse_group_sender_from_content("wxid_member:\n收到")
+    content = reader._clean_group_content("wxid_member:\n收到", sender)
+
+    assert sender == "wxid_member"
+    assert content == "收到"
+    assert reader._clean_group_content("时间: 10:00", "room@chatroom") == "时间: 10:00"
+
+
+def test_windows_v4_missing_group_sender_keeps_safe_room_fallback():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE Name2Id (user_name TEXT)")
+    reader = WindowsDBReader()
+    reader._sqlite_conn = conn
+    row = conn.execute(
+        "SELECT 0 AS real_sender_id, ? AS source",
+        (b"unknown sender bytes",),
+    ).fetchone()
+
+    assert reader._resolve_v4_group_sender(row, "room@chatroom") == "room@chatroom"
+    assert reader._clean_group_content("普通消息", "room@chatroom") == "普通消息"
+
+    reader.close()
+
+
+def test_windows_v4_missing_sender_id_fails_closed(monkeypatch):
+    """即使已知本人 rowid，消息缺少发送者 ID 时也不能猜成对方。"""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE Name2Id (user_name TEXT)")
+    conn.execute("INSERT INTO Name2Id (rowid, user_name) VALUES (7, 'wxid_me')")
+    reader = WindowsDBReader()
+    reader._sqlite_conn = conn
+    monkeypatch.setattr(reader, "get_current_wxid", lambda: "wxid_me")
+    row = conn.execute(
+        "SELECT 0 AS real_sender_id, 3 AS status, "
+        "2 AS origin_source, 100 AS server_seq"
+    ).fetchone()
+
+    assert reader._is_self_sent_v4_row(row) is True
+
+    reader.close()
+
+
+@pytest.mark.parametrize("self_sender_id", [2, 987654])
+def test_windows_v4_infers_self_sender_from_dominant_local_markers(
+    monkeypatch,
+    self_sender_id,
+):
+    """sender_id 在不同机器上变化时应动态识别，不能写死本机值。"""
+    reader = WindowsDBReader()
+    reader._sqlite_conn = sqlite3.connect(":memory:")
+    reader._sqlite_conn.row_factory = sqlite3.Row
+    reader._msg_table_cache = [
+        ("Msg_a", "friend_a"),
+        ("Msg_b", "friend_b"),
+    ]
+    for table in ("Msg_a", "Msg_b"):
+        reader._sqlite_conn.execute(
+            f'CREATE TABLE "{table}" ('
+            "real_sender_id INTEGER, status INTEGER, "
+            "origin_source INTEGER, server_seq INTEGER)"
+        )
+    reader._sqlite_conn.executemany(
+        "INSERT INTO Msg_a VALUES (?, ?, ?, ?)",
+        [(self_sender_id, 2, 1, 0)] * 5 + [(31, 3, 2, 100)] * 3,
+    )
+    reader._sqlite_conn.executemany(
+        "INSERT INTO Msg_b VALUES (?, ?, ?, ?)",
+        [(self_sender_id, 2, 1, 0)] * 4 + [(40, 3, 2, 101)] * 2,
+    )
+    monkeypatch.setattr(reader, "get_current_wxid", lambda: "alias_folder")
+
+    assert reader._get_current_sender_id() == self_sender_id
+    assert reader._is_self_sent_v4_row({
+        "real_sender_id": self_sender_id,
+        "status": 3,
+        "origin_source": 2,
+        "server_seq": 999,
+    }) is True
+    assert reader._is_self_sent_v4_row({
+        "real_sender_id": 31,
+        "status": 3,
+        "origin_source": 2,
+        "server_seq": 998,
+    }) is False
+
+    reader.close()
+
+
+def test_windows_v4_ambiguous_direction_fails_closed(monkeypatch):
+    """两个候选证据接近时不能猜测；所有不确定消息均按自己处理以阻止回复。"""
+    reader = WindowsDBReader()
+    reader._sqlite_conn = sqlite3.connect(":memory:")
+    reader._sqlite_conn.row_factory = sqlite3.Row
+    reader._msg_table_cache = [
+        ("Msg_a", "friend_a"),
+        ("Msg_b", "friend_b"),
+    ]
+    for table in ("Msg_a", "Msg_b"):
+        reader._sqlite_conn.execute(
+            f'CREATE TABLE "{table}" ('
+            "real_sender_id INTEGER, status INTEGER, "
+            "origin_source INTEGER, server_seq INTEGER)"
+        )
+    reader._sqlite_conn.executemany(
+        "INSERT INTO Msg_a VALUES (?, ?, ?, ?)",
+        [(7, 2, 1, 0)] * 6,
+    )
+    reader._sqlite_conn.executemany(
+        "INSERT INTO Msg_b VALUES (?, ?, ?, ?)",
+        [(9, 2, 1, 0)] * 5,
+    )
+    monkeypatch.setattr(reader, "get_current_wxid", lambda: "unknown_account")
+
+    assert reader._get_current_sender_id() is None
+    assert reader._is_self_sent_v4_row({
+        "real_sender_id": 31,
+        "status": 3,
+        "origin_source": 2,
+        "server_seq": 998,
+    }) is True
+
+    reader.close()
+
+
+def test_windows_v4_conflicting_evidence_fails_closed(monkeypatch):
+    """本机发送标记与跨私聊覆盖率指向不同 ID 时必须拒绝判定。"""
+    reader = WindowsDBReader()
+    reader._sqlite_conn = sqlite3.connect(":memory:")
+    reader._sqlite_conn.row_factory = sqlite3.Row
+    reader._msg_table_cache = [("Msg_group", "room@chatroom")]
+    reader._sqlite_conn.execute(
+        "CREATE TABLE Msg_group (real_sender_id INTEGER, status INTEGER, "
+        "origin_source INTEGER, server_seq INTEGER)"
+    )
+    reader._sqlite_conn.executemany(
+        "INSERT INTO Msg_group VALUES (?, ?, ?, ?)",
+        [(99, 2, 1, 0)] * 20,
+    )
+
+    for index in range(6):
+        table = f"Msg_private_{index}"
+        reader._msg_table_cache.append((table, f"friend_{index}"))
+        reader._sqlite_conn.execute(
+            f'CREATE TABLE "{table}" ('
+            "real_sender_id INTEGER, status INTEGER, "
+            "origin_source INTEGER, server_seq INTEGER)"
+        )
+        reader._sqlite_conn.executemany(
+            f'INSERT INTO "{table}" VALUES (?, ?, ?, ?)',
+            [(77, 3, 2, 100 + index), (1000 + index, 3, 2, 200 + index)],
+        )
+    monkeypatch.setattr(reader, "get_current_wxid", lambda: "unknown_account")
+
+    assert reader._get_current_sender_id() is None
+
+    reader.close()

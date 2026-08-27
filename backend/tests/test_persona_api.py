@@ -64,11 +64,19 @@ class FakeDistiller:
 
 class FakeReader:
     def find_database_files(self):
-        return ["/tmp/message_0.db"]
+        # 公众号消息库故意排在前面，确保接口不会因为子串匹配选错库。
+        return [
+            "/tmp/message/biz_message_0.db",
+            "/tmp/message/message_0.db",
+        ]
 
     def open_db(self, path, key):
-        assert path == "/tmp/message_0.db"
+        assert path == "/tmp/message/message_0.db"
         assert key == bytes.fromhex("aa" * 32)
+        return True
+
+    def is_message_db(self):
+        return True
 
     def get_my_messages(self, limit: int, since_days: int):
         assert limit == 123
@@ -101,11 +109,14 @@ def test_analyze_persona_uses_configured_limits_and_returns_skill(monkeypatch):
         "app.core.platform.Platform.get",
         lambda: SimpleNamespace(
             key_extractor=SimpleNamespace(
-                load_keys=lambda: {"message_0.db": "aa" * 32}
-            )
+                load_keys=lambda: {
+                    "message/biz_message_0.db": "bb" * 32,
+                    "message/message_0.db": "aa" * 32,
+                }
+            ),
+            db_reader=FakeReader(),
         ),
     )
-    monkeypatch.setattr("app.core.db_reader_macos.MacOSDBReader", FakeReader)
     monkeypatch.setattr(
         persona_api,
         "get_config",
@@ -137,11 +148,14 @@ def test_analyze_persona_resets_agent_distiller_cache(monkeypatch):
         "app.core.platform.Platform.get",
         lambda: SimpleNamespace(
             key_extractor=SimpleNamespace(
-                load_keys=lambda: {"message_0.db": "aa" * 32}
-            )
+                load_keys=lambda: {
+                    "message/biz_message_0.db": "bb" * 32,
+                    "message/message_0.db": "aa" * 32,
+                }
+            ),
+            db_reader=FakeReader(),
         ),
     )
-    monkeypatch.setattr("app.core.db_reader_macos.MacOSDBReader", FakeReader)
     monkeypatch.setattr(
         persona_api,
         "get_config",

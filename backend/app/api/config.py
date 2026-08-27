@@ -29,6 +29,66 @@ def _get_config_path() -> str:
     )
 
 
+def _normalize_group_reply_rules(
+    value,
+    group_whitelist: list[str],
+) -> list[dict]:
+    """校验并规范化群聊专属回复规则。"""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise HTTPException(422, "群聊专属规则必须是列表")
+    if not isinstance(group_whitelist, list):
+        raise HTTPException(422, "群聊白名单格式错误")
+
+    allowed_rooms = {str(room).strip() for room in group_whitelist if str(room).strip()}
+    enabled_rooms: set[str] = set()
+    normalized: list[dict] = []
+
+    for index, item in enumerate(value, 1):
+        if not isinstance(item, dict):
+            raise HTTPException(422, f"第 {index} 条群聊专属规则格式错误")
+
+        room_id = str(item.get("room_id", "")).strip()
+        match_type = str(item.get("match_type", "contains")).strip().lower()
+        keyword = str(item.get("keyword", "")).strip()
+        reply = str(item.get("reply", "")).strip()
+        enabled = bool(item.get("enabled", True))
+        rule_only = bool(item.get("rule_only", True))
+
+        if not room_id:
+            raise HTTPException(422, f"第 {index} 条群聊专属规则未选择群聊")
+        if room_id not in allowed_rooms:
+            raise HTTPException(422, f"群聊 {room_id} 不在群聊白名单中")
+        if match_type != "contains":
+            raise HTTPException(422, "群聊专属规则目前只支持包含匹配")
+        if not keyword:
+            raise HTTPException(422, f"第 {index} 条群聊专属规则关键词不能为空")
+        if len(keyword) > 100:
+            raise HTTPException(422, f"第 {index} 条群聊专属规则关键词过长")
+        if not reply:
+            raise HTTPException(422, f"第 {index} 条群聊专属规则回复内容不能为空")
+        if len(reply) > 500:
+            raise HTTPException(422, f"第 {index} 条群聊专属规则回复内容过长")
+        if enabled and room_id in enabled_rooms:
+            raise HTTPException(422, f"群聊 {room_id} 只能启用一条专属规则")
+        if enabled:
+            enabled_rooms.add(room_id)
+
+        normalized.append(
+            {
+                "room_id": room_id,
+                "match_type": "contains",
+                "keyword": keyword,
+                "reply": reply,
+                "rule_only": rule_only,
+                "enabled": enabled,
+            }
+        )
+
+    return normalized
+
+
 # --- Chat Config ---
 @router.get("/config/chat")
 async def get_chat_config():
@@ -38,18 +98,32 @@ async def get_chat_config():
 @router.put("/config/chat")
 async def update_chat_config(data: dict):
     cfg = get_config()
-    cfg.auto_reply.update(data)
+    normalized_data = dict(data)
+    if "group_reply_rules" in normalized_data or "group_whitelist" in normalized_data:
+        effective_whitelist = normalized_data.get(
+            "group_whitelist",
+            cfg.auto_reply.get("group_whitelist", []),
+        )
+        normalized_data["group_reply_rules"] = _normalize_group_reply_rules(
+            normalized_data.get(
+                "group_reply_rules",
+                cfg.auto_reply.get("group_reply_rules", []),
+            ),
+            effective_whitelist,
+        )
 
     config_path = _get_config_path()
     try:
         with open(config_path, "r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f)
-        raw["auto_reply"].update(data)
+            raw = yaml.safe_load(f) or {}
+        raw.setdefault("auto_reply", {}).update(normalized_data)
         with open(config_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(raw, f, allow_unicode=True, default_flow_style=False)
     except Exception as e:
         raise HTTPException(500, f"配置保存失败: {e}")
 
+    # 文件保存成功后再更新进程内配置，群聊专属规则可立即生效。
+    cfg.auto_reply.update(normalized_data)
     return {"success": True}
 
 
