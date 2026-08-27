@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from datetime import datetime, time as datetime_time
 from typing import Optional
 
@@ -59,6 +60,10 @@ class AutoReplyPipeline:
         self._buffer: dict[str, list] = {}
         self._buffer_timers: dict[str, asyncio.Task] = {}
         self._debounce_seconds = 20
+        # 专属群规则首条命中立即回复；同一规则在短窗口内只触发一次，
+        # 避免微信数据库重复读到同一批消息时造成连发。
+        self._group_rule_dedupe_seconds = 20
+        self._group_rule_last_trigger_at: dict[tuple[str, str, str], float] = {}
         self._recent_chat_context: dict[str, list[str]] = {}
         self._recent_context_limit = 12
         platform = Platform.get()
@@ -159,6 +164,7 @@ class AutoReplyPipeline:
             timer.cancel()
         self._buffer_timers.clear()
         self._buffer.clear()
+        self._group_rule_last_trigger_at.clear()
         if self._monitor:
             await self._monitor.stop()
         logger.info("自动回复流水线已停止")
@@ -512,6 +518,38 @@ class AutoReplyPipeline:
             )
             return
 
+        # 专属群规则走即时通道，不进入普通消息的 20 秒合并等待。
+        # 首条命中会立刻占用去重窗口；即使发送结果暂未确认，也不会补发，
+        # 以降低重复点击和重复回复风险。
+        group_rule = (
+            self._find_group_reply_rule(config, receiver)
+            if msg.is_group
+            else None
+        )
+        if group_rule and group_rule.get("immediate", True):
+            group_rule_only = bool(group_rule.get("rule_only", True))
+            if self._group_reply_rule_matches(group_rule, msg.content):
+                reply_text = str(group_rule.get("reply", "")).strip()
+                if not self._reserve_group_rule_trigger(receiver, group_rule):
+                    logger.info(
+                        "群聊专属规则短窗口内已触发，跳过重复回复 | room=%s",
+                        receiver,
+                    )
+                    return
+                logger.info(
+                    "群聊专属规则即时命中 | room=%s | keyword=%s",
+                    receiver,
+                    group_rule.get("keyword", ""),
+                )
+                await self._send_reply(reply_text, receiver, msg)
+                return
+            if group_rule_only:
+                logger.debug(
+                    "群聊专属规则未命中且禁止兜底，保持静默 | room=%s",
+                    receiver,
+                )
+                return
+
         # 防抖：取消旧定时器，入队，启动新 20s 定时器
         if buffer_key in self._buffer_timers:
             self._buffer_timers[buffer_key].cancel()
@@ -576,13 +614,8 @@ class AutoReplyPipeline:
         # 群聊专属规则优先于全局规则和 AI。包含匹配直接针对原始消息文本，
         # 因此不受 Windows 群消息中的发送者前缀或关键词位置影响。
         if group_rule:
-            supported_match = (
-                str(group_rule.get("match_type", "contains")).lower()
-                == "contains"
-            )
-            keyword = str(group_rule.get("keyword", "")).casefold()
-            matched = supported_match and bool(keyword) and any(
-                keyword in str(item.content or "").casefold()
+            matched = any(
+                self._group_reply_rule_matches(group_rule, item.content)
                 for item in reply_messages
             )
             if matched:
@@ -625,42 +658,83 @@ class AutoReplyPipeline:
             ai_msg.content = combined
             reply_text = await self._ai_chat(ai_msg)
 
-        reply_text = self._clean_reply_for_wechat(reply_text)
-
         # 3. 发送回复
         if reply_text:
-            display_name = self._name_map.get(receiver, receiver)
-            force_skip = self._is_unsearchable_name(display_name)
-            if force_skip:
-                logger.error(
-                    "接收者名称无法搜索，拒绝自动发送 | receiver=%s | display_name=%s | is_group=%s",
-                    receiver, display_name,
-                    msg.is_group,
-                )
-                return
-            success = await self._sender.send_text(
-                reply_text,
+            await self._send_reply(reply_text, receiver, msg)
+
+    @staticmethod
+    def _group_reply_rule_matches(rule: dict, content: str) -> bool:
+        """使用原始消息文本进行大小写无关的 Unicode 包含匹配。"""
+        if str(rule.get("match_type", "contains")).lower() != "contains":
+            return False
+        keyword = str(rule.get("keyword", "")).casefold()
+        return bool(keyword) and keyword in str(content or "").casefold()
+
+    def _reserve_group_rule_trigger(self, room_id: str, rule: dict) -> bool:
+        """为专属群规则占用短去重窗口；首条立即放行，后续直接丢弃。"""
+        now = time.monotonic()
+        key = (
+            str(room_id),
+            str(rule.get("keyword", "")).casefold(),
+            str(rule.get("reply", "")),
+        )
+        last_trigger_at = self._group_rule_last_trigger_at.get(key)
+        if (
+            last_trigger_at is not None
+            and now - last_trigger_at < self._group_rule_dedupe_seconds
+        ):
+            return False
+
+        self._group_rule_last_trigger_at[key] = now
+        cutoff = now - self._group_rule_dedupe_seconds
+        self._group_rule_last_trigger_at = {
+            item_key: triggered_at
+            for item_key, triggered_at in self._group_rule_last_trigger_at.items()
+            if triggered_at >= cutoff
+        }
+        return True
+
+    async def _send_reply(self, reply_text: str, receiver: str, msg) -> bool:
+        """清洗并发送回复；发送动作发生后绝不由流水线自动补发。"""
+        reply_text = self._clean_reply_for_wechat(reply_text)
+        if not reply_text:
+            return False
+
+        display_name = self._name_map.get(receiver, receiver)
+        if self._is_unsearchable_name(display_name):
+            logger.error(
+                "接收者名称无法搜索，拒绝自动发送 | receiver=%s | display_name=%s | is_group=%s",
+                receiver,
                 display_name,
-                force_skip=False,
-                is_group=msg.is_group,
-                target_id=receiver,
+                msg.is_group,
             )
-            if success:
-                if self._monitor:
-                    self._monitor.remember_sent_message(receiver, reply_text)
-                logger.info(
-                    "自动回复已发送 | receiver=%s | reply=%s",
-                    display_name,
-                    reply_text[:50],
-                )
-                await self._park_after_reply()
-            else:
-                logger.error(
-                    "自动回复发送失败 | receiver=%s | display_name=%s | is_group=%s",
-                    receiver,
-                    display_name,
-                    msg.is_group,
-                )
+            return False
+
+        success = await self._sender.send_text(
+            reply_text,
+            display_name,
+            force_skip=False,
+            is_group=msg.is_group,
+            target_id=receiver,
+        )
+        if success:
+            if self._monitor:
+                self._monitor.remember_sent_message(receiver, reply_text)
+            logger.info(
+                "自动回复已发送 | receiver=%s | reply=%s",
+                display_name,
+                reply_text[:50],
+            )
+            await self._park_after_reply()
+            return True
+
+        logger.error(
+            "自动回复发送失败 | receiver=%s | display_name=%s | is_group=%s",
+            receiver,
+            display_name,
+            msg.is_group,
+        )
+        return False
 
     @staticmethod
     def _find_group_reply_rule(config: dict, room_id: str) -> Optional[dict]:

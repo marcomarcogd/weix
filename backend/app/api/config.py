@@ -55,6 +55,7 @@ def _normalize_group_reply_rules(
         reply = str(item.get("reply", "")).strip()
         enabled = bool(item.get("enabled", True))
         rule_only = bool(item.get("rule_only", True))
+        immediate = bool(item.get("immediate", True))
 
         if not room_id:
             raise HTTPException(422, f"第 {index} 条群聊专属规则未选择群聊")
@@ -82,6 +83,7 @@ def _normalize_group_reply_rules(
                 "keyword": keyword,
                 "reply": reply,
                 "rule_only": rule_only,
+                "immediate": immediate,
                 "enabled": enabled,
             }
         )

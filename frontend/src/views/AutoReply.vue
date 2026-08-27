@@ -7,7 +7,7 @@
         <div class="card-header">
           <div>
             <div class="card-title">群聊专属规则</div>
-            <div class="card-subtitle">命中时发送自定义回复；未命中时该群保持静默，不调用 AI 或全局规则。</div>
+            <div class="card-subtitle">每个群可单独选择即时回复或等待 20 秒合并；未命中时保持静默。</div>
           </div>
           <el-button type="primary" :disabled="groupWhitelist.length === 0" @click="showGroupDialog()">
             新增群聊专属规则
@@ -30,6 +30,13 @@
         </el-table-column>
         <el-table-column prop="keyword" label="包含关键词" min-width="150" />
         <el-table-column prop="reply" label="回复内容" min-width="140" show-overflow-tooltip />
+        <el-table-column label="回复时机" width="110">
+          <template #default="{ row }">
+            <el-tag :type="row.immediate ? 'success' : 'info'">
+              {{ row.immediate ? '立即回复' : '20 秒合并' }}
+            </el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="未命中" width="120">
           <template #default><el-tag type="info">保持静默</el-tag></template>
         </el-table-column>
@@ -130,11 +137,17 @@
         <el-form-item label="回复内容" required>
           <el-input v-model="groupForm.reply" type="textarea" :rows="3" placeholder="例如：1（可自定义）" maxlength="500" show-word-limit />
         </el-form-item>
+        <el-form-item label="立即回复">
+          <el-switch v-model="groupForm.immediate" />
+          <span class="field-tip">
+            {{ groupForm.immediate ? '检测到关键词后马上发送，不等待消息合并' : '等待 20 秒，合并该群消息后再匹配' }}
+          </span>
+        </el-form-item>
         <el-form-item label="启用">
           <el-switch v-model="groupForm.enabled" />
         </el-form-item>
         <el-alert
-          title="该群只执行这条专属规则；未命中时不会调用 AI 或其他全局规则。"
+          title="该群只执行这条专属规则；未命中时不会调用 AI 或其他全局规则。每条规则可独立设置回复时机。"
           type="info"
           :closable="false"
           show-icon
@@ -167,6 +180,7 @@ interface GroupReplyRule {
   keyword: string
   reply: string
   rule_only: boolean
+  immediate: boolean
   enabled: boolean
 }
 
@@ -187,6 +201,7 @@ const groupForm = reactive<GroupReplyRule>({
   keyword: '@所有人',
   reply: '1',
   rule_only: true,
+  immediate: true,
   enabled: true,
 })
 type RuleType = 'keyword' | 'regex' | 'intent'
@@ -236,6 +251,7 @@ async function loadGroupRules() {
     keyword: String(rule.keyword || ''),
     reply: String(rule.reply || ''),
     rule_only: rule.rule_only !== false,
+    immediate: rule.immediate !== false,
     enabled: rule.enabled !== false,
   }))
   chatrooms.value = contactsRes.data?.chatrooms || []
@@ -252,6 +268,7 @@ function showGroupDialog(row?: GroupReplyRule, index: number = -1) {
     keyword: '@所有人',
     reply: '1',
     rule_only: true,
+    immediate: true,
     enabled: true,
   })
   // 该功能的目标是专属群只执行固定规则，不允许在此处打开 AI 兜底。
@@ -287,6 +304,7 @@ async function saveGroupRule() {
     keyword,
     reply,
     rule_only: true,
+    immediate: groupForm.immediate,
     enabled: groupForm.enabled,
   }
   const nextRules = [...groupRules.value]
@@ -367,6 +385,12 @@ onMounted(async () => {
 
 .card-subtitle {
   margin-top: 4px;
+  color: #909399;
+  font-size: 13px;
+}
+
+.field-tip {
+  margin-left: 12px;
   color: #909399;
   font-size: 13px;
 }

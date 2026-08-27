@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 from datetime import datetime
@@ -297,6 +298,94 @@ def test_clean_reply_for_wechat_removes_extra_spaces_newlines_and_emoji():
     assert text == "好的我知道了！"
 
 
+@pytest.mark.asyncio
+async def test_group_reply_rule_immediate_mode_sends_without_buffering(monkeypatch):
+    config = {
+        "enabled": True,
+        "reply_mode": "all",
+        "group_chat_mode": "whitelist",
+        "group_whitelist": ["room@chatroom"],
+        "group_reply_rules": [
+            {
+                "room_id": "room@chatroom",
+                "match_type": "contains",
+                "keyword": "@所有人",
+                "reply": "1",
+                "rule_only": True,
+                "immediate": True,
+                "enabled": True,
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        "app.core.auto_reply_pipeline.get_config",
+        lambda: SimpleNamespace(auto_reply=config),
+    )
+
+    sender = FakeSender()
+    pipeline = AutoReplyPipeline()
+    pipeline._sender = sender
+    pipeline._monitor = FakeMonitor()
+    pipeline._park_after_send = False
+    pipeline._debounce_seconds = 3600
+    pipeline._name_map = {"room@chatroom": "测试群"}
+
+    await pipeline._handle_message(_group_msg(content="通知 @所有人 请马上回复", msg_id="1"))
+    await pipeline._handle_message(_group_msg(content="@所有人 重复通知", msg_id="2"))
+
+    assert [item[0] for item in sender.sent] == ["1"]
+    assert pipeline._buffer == {}
+    assert pipeline._buffer_timers == {}
+    assert pipeline._monitor.remembered == [("room@chatroom", "1")]
+
+
+@pytest.mark.asyncio
+async def test_group_reply_rule_can_disable_immediate_mode(monkeypatch):
+    config = {
+        "enabled": True,
+        "reply_mode": "all",
+        "group_chat_mode": "whitelist",
+        "group_whitelist": ["room@chatroom"],
+        "group_reply_rules": [
+            {
+                "room_id": "room@chatroom",
+                "match_type": "contains",
+                "keyword": "@所有人",
+                "reply": "自定义回复",
+                "rule_only": True,
+                "immediate": False,
+                "enabled": True,
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        "app.core.auto_reply_pipeline.get_config",
+        lambda: SimpleNamespace(auto_reply=config),
+    )
+
+    sender = FakeSender()
+    pipeline = AutoReplyPipeline()
+    pipeline._sender = sender
+    pipeline._monitor = FakeMonitor()
+    pipeline._park_after_send = False
+    pipeline._debounce_seconds = 3600
+    pipeline._name_map = {"room@chatroom": "测试群"}
+
+    await pipeline._handle_message(_group_msg(content="@所有人 稍后合并", msg_id="1"))
+
+    assert sender.sent == []
+    assert len(pipeline._buffer["room@chatroom"]) == 1
+    timer = pipeline._buffer_timers.pop("room@chatroom")
+    timer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await timer
+
+    pipeline._debounce_seconds = 0
+    await pipeline._flush_buffer("room@chatroom")
+
+    assert [item[0] for item in sender.sent] == ["自定义回复"]
+
+
 @pytest.mark.parametrize(
     "content",
     [
@@ -482,6 +571,7 @@ def test_group_reply_rule_config_keeps_custom_reply_and_requires_whitelist():
                 "keyword": "@所有人",
                 "reply": "自定义内容",
                 "rule_only": True,
+                "immediate": False,
                 "enabled": True,
             }
         ],
@@ -489,6 +579,7 @@ def test_group_reply_rule_config_keeps_custom_reply_and_requires_whitelist():
     )
 
     assert rules[0]["reply"] == "自定义内容"
+    assert rules[0]["immediate"] is False
     with pytest.raises(HTTPException):
         _normalize_group_reply_rules(rules, [])
 
