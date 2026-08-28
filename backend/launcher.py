@@ -636,7 +636,20 @@ class ServiceController:
         }
         if self._normalized_path(target) not in normalized_arguments:
             return False
-        if self._normalized_path(cwd) != self._normalized_path(expected_cwd):
+        cwd_matches = self._normalized_path(cwd) == self._normalized_path(
+            expected_cwd
+        )
+        is_backend_wrapper = (
+            kind == "backend"
+            and bool(arguments)
+            and self._normalized_path(arguments[0])
+            == self._normalized_path(
+                self.project_root / "venv" / "Scripts" / "python.exe"
+            )
+        )
+        # python.exe 的 venv 启动包装器会在子进程接管后把自身 cwd 切到
+        # TEMP；它仍是本轮由管理器创建的父进程，允许短暂跟踪到端口就绪。
+        if not cwd_matches and not is_backend_wrapper:
             return False
         if not self._option_matches(arguments, "--port", str(port)):
             return False
@@ -752,20 +765,36 @@ class ServiceController:
             return None
         try:
             listener = psutil.Process(listener_pid)
-            candidates = [listener] + listener.parents()
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             return None
+        # Windows 虚拟环境可能先启动包装进程，再由真正的 Python 子进程
+        # 监听端口。始终跟踪监听者，避免包装进程退出后误报服务退出。
+        return self._reference_from_process(
+            listener,
+            kind,
+            adopted=True,
+        )
 
-        # 选择最高层仍带有相同启动签名的进程，停止时才能覆盖其整个子树。
-        reference = None
-        for candidate in candidates:
-            matched = self._reference_from_process(
-                candidate,
-                kind,
-                adopted=True,
-            )
-            if matched is not None:
-                reference = matched
+    def _set_service_reference(
+        self,
+        kind: str,
+        reference: Optional[ServiceProcessRef],
+    ) -> None:
+        with self._process_lock:
+            if kind == "backend":
+                self._backend_process = reference
+            elif kind == "frontend":
+                self._frontend_process = reference
+            else:
+                raise ValueError(f"未知服务类型：{kind}")
+
+    def _bind_listener_reference(
+        self,
+        kind: str,
+    ) -> Optional[ServiceProcessRef]:
+        reference = self._discover_reference_from_listener(kind)
+        if reference is not None:
+            self._set_service_reference(kind, reference)
         return reference
 
     def _load_saved_state(self) -> dict[str, Any]:
@@ -857,15 +886,15 @@ class ServiceController:
             ):
                 reference = current[kind]
                 if not self._is_running(reference):
-                    reference = self._reference_from_saved_state(saved, kind)
-                    if reference is None and port_is_listening(port):
-                        reference = self._discover_reference_from_listener(kind)
+                    reference = (
+                        self._discover_reference_from_listener(kind)
+                        if port_is_listening(port)
+                        else None
+                    )
+                    if reference is None:
+                        reference = self._reference_from_saved_state(saved, kind)
                     if reference is not None:
-                        with self._process_lock:
-                            if kind == "backend":
-                                self._backend_process = reference
-                            else:
-                                self._frontend_process = reference
+                        self._set_service_reference(kind, reference)
                         adopted_names.append(f"{label}（PID {reference.pid}）")
                 if port_is_listening(port) and reference is None:
                     pid = listening_pid(port)
@@ -997,18 +1026,39 @@ class ServiceController:
                 backend_ready = False
                 frontend_ready = False
                 while time.monotonic() < deadline:
-                    if backend.poll() is not None:
+                    backend_ready = backend_ready or url_is_ready(BACKEND_HEALTH_URL)
+                    frontend_ready = frontend_ready or url_is_ready(FRONTEND_URL)
+                    if (
+                        backend.poll() is not None
+                        and not backend_ready
+                        and self._bind_listener_reference("backend") is None
+                    ):
                         raise RuntimeError(
                             f"后端进程已退出，退出码 {backend.returncode}"
                         )
-                    if frontend.poll() is not None:
+                    if (
+                        frontend.poll() is not None
+                        and not frontend_ready
+                        and self._bind_listener_reference("frontend") is None
+                    ):
                         raise RuntimeError(
                             f"前端进程已退出，退出码 {frontend.returncode}"
                         )
-                    backend_ready = backend_ready or url_is_ready(BACKEND_HEALTH_URL)
-                    frontend_ready = frontend_ready or url_is_ready(FRONTEND_URL)
                     if backend_ready and frontend_ready:
+                        backend_listener = self._bind_listener_reference("backend")
+                        frontend_listener = self._bind_listener_reference("frontend")
+                        if backend_listener is None or frontend_listener is None:
+                            raise RuntimeError(
+                                "服务端口已就绪，但无法确认实际监听进程身份"
+                            )
+                        self._persist_service_state()
                         self.log("manager", "前后端均已就绪")
+                        self.log(
+                            "manager",
+                            "已跟踪实际监听进程："
+                            f"后端 PID {backend_listener.pid}，"
+                            f"前端 PID {frontend_listener.pid}",
+                        )
                         return True, "服务已启动"
                     time.sleep(0.25)
                 raise TimeoutError(
@@ -1023,6 +1073,8 @@ class ServiceController:
 
     def stop(self, force: bool = False) -> tuple[bool, str]:
         with self._operation_lock:
+            # 包装进程可能已完成交接；停止前先绑定真正的端口监听者。
+            self.process_status()
             backend, frontend = self._process_snapshot()
             if not self._is_running(backend) and not self._is_running(frontend):
                 self._clear_process_references()
@@ -1074,17 +1126,38 @@ class ServiceController:
             return True, "服务已停止"
 
     def any_process_running(self) -> bool:
-        backend, frontend = self._process_snapshot()
-        return self._is_running(backend) or self._is_running(frontend)
+        backend_running, frontend_running = self.process_status()
+        return backend_running or frontend_running
 
     def process_status(self) -> tuple[bool, bool]:
         backend, frontend = self._process_snapshot()
         backend_running = self._is_running(backend)
         frontend_running = self._is_running(frontend)
-        if (backend is not None and not backend_running) or (
-            frontend is not None and not frontend_running
-        ):
-            self._clear_process_references()
+        changed = False
+
+        if not backend_running and port_is_listening(BACKEND_PORT):
+            replacement = self._discover_reference_from_listener("backend")
+            if replacement is not None:
+                self._set_service_reference("backend", replacement)
+                backend = replacement
+                backend_running = True
+                changed = True
+        if not frontend_running and port_is_listening(FRONTEND_PORT):
+            replacement = self._discover_reference_from_listener("frontend")
+            if replacement is not None:
+                self._set_service_reference("frontend", replacement)
+                frontend = replacement
+                frontend_running = True
+                changed = True
+
+        if backend is not None and not backend_running:
+            self._set_service_reference("backend", None)
+            changed = True
+        if frontend is not None and not frontend_running:
+            self._set_service_reference("frontend", None)
+            changed = True
+        if changed:
+            self._persist_service_state()
         return backend_running, frontend_running
 
     def _process_snapshot(
