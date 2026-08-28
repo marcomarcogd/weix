@@ -1,18 +1,32 @@
 """平台相关 API：联系人列表、群聊列表、数据库状态。"""
 
+import logging
 import os
 
-from fastapi import APIRouter, Depends, Query
+import yaml
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 
 from app.api.auth import verify_token
+from app.config import get_config
 from app.core.platform import Platform
-from app.utils.paths import get_data_dir
+from app.utils.paths import get_config_dir, get_data_dir
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/platform",
     tags=["platform"],
     dependencies=[Depends(verify_token)],
 )
+
+
+class AccountSelection(BaseModel):
+    wxid: str
+
+
+def _config_path() -> str:
+    return os.getenv("WEIX_CONFIG", str(get_config_dir() / "config.yaml"))
 
 
 def _normalize_db_key_path(path: str) -> str:
@@ -169,3 +183,94 @@ async def platform_status():
         "key_ready": key_ready,
         "db_ready": False,  # 需要实际尝试打开才能确认
     }
+
+
+@router.get("/accounts")
+async def list_accounts():
+    """列出可选择的本机微信账号及当前进程绑定状态。"""
+    platform = Platform.get()
+    if not platform.is_windows:
+        return {"accounts": [], "selected": "", "active": "", "bound_pid": None}
+    extractor = platform.key_extractor
+    accounts = (
+        extractor.get_available_accounts()
+        if hasattr(extractor, "get_available_accounts")
+        else []
+    )
+    selected = (
+        extractor.selected_account()
+        if hasattr(extractor, "selected_account")
+        else ""
+    )
+    active = str(getattr(extractor, "bound_account", "") or "")
+    bound_pid = getattr(extractor, "bound_pid", None)
+    for account in accounts:
+        wxid = str(account.get("wxid", "") or "")
+        account["selected"] = bool(selected and wxid.casefold() == selected.casefold())
+        account["active"] = bool(active and wxid.casefold() == active.casefold())
+        account["online"] = bool(account["active"] and bound_pid)
+        # 数据目录仅用于服务端发现，不返回给网页。
+        account.pop("data_dir", None)
+    return {
+        "accounts": accounts,
+        "selected": selected,
+        "active": active,
+        "bound_pid": int(bound_pid) if bound_pid else None,
+    }
+
+
+@router.put("/account")
+async def select_account(payload: AccountSelection):
+    """保存账号选择；由 WeixManager 完成正常重启后再重新绑定。"""
+    platform = Platform.get()
+    if not platform.is_windows:
+        raise HTTPException(400, "账号选择仅适用于 Windows")
+    extractor = platform.key_extractor
+    requested = payload.wxid.strip()
+    available = {
+        str(item.get("wxid", "") or ""): item
+        for item in extractor.get_available_accounts()
+    }
+    matched = next(
+        (name for name in available if name.casefold() == requested.casefold()),
+        "",
+    )
+    if not matched:
+        raise HTTPException(422, "所选微信账号不在当前可用账号列表中")
+
+    try:
+        path = _config_path()
+        with open(path, "r", encoding="utf-8") as file:
+            raw = yaml.safe_load(file) or {}
+        raw.setdefault("wechat", {}).setdefault("windows", {})["account"] = matched
+        with open(path, "w", encoding="utf-8") as file:
+            yaml.safe_dump(raw, file, allow_unicode=True, default_flow_style=False)
+    except Exception as exc:
+        raise HTTPException(500, f"账号选择保存失败: {exc}") from exc
+
+    cfg = get_config()
+    cfg.wechat.setdefault("windows", {})["account"] = matched
+    if hasattr(extractor, "clear_process_binding"):
+        extractor.clear_process_binding()
+    sender = getattr(platform, "_sender", None)
+    if sender is not None and hasattr(sender, "reset_search_state"):
+        sender.reset_search_state()
+    logger.warning("微信账号选择已变更，重启服务前自动发送保持静默: %s", matched)
+    return {"success": True, "selected": matched, "requires_restart": True}
+
+
+@router.get("/uia/diagnose")
+async def diagnose_uia():
+    """只读检查微信 UIA 树，不激活窗口、不输入、不发送。"""
+    platform = Platform.get()
+    if not platform.is_windows:
+        raise HTTPException(400, "UIA 检测仅适用于 Windows")
+    sender = platform.sender
+    if not hasattr(sender, "diagnose_uia"):
+        raise HTTPException(503, "当前 Windows 发送器不支持 UIA 检测")
+    result = await sender.diagnose_uia()
+    if result.get("narrator_hint"):
+        result["help"] = (
+            "请在 Windows 中开启并关闭一次“讲述人”，然后保持微信主窗口已登录并重新检测。"
+        )
+    return result

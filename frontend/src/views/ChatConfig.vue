@@ -73,6 +73,75 @@
             <el-radio label="all">全部回复</el-radio>
           </el-radio-group>
         </el-form-item>
+        <el-divider content-position="left">Windows 微信 UIA 发送</el-divider>
+        <el-alert
+          title="自动发送仅使用 UIA 控件定位，不会回退到固定坐标、OCR 或鼠标点击。重名、账号不明或控件不唯一时会保持静默。"
+          type="warning"
+          :closable="false"
+          show-icon
+          style="margin-bottom: 18px"
+        />
+        <el-form-item label="微信账号">
+          <div style="width: 100%">
+            <el-select
+              v-model="selectedAccount"
+              placeholder="请选择本机微信账号"
+              style="width: 100%"
+              :loading="accountsLoading"
+              @change="changeAccount"
+            >
+              <el-option
+                v-for="account in accounts"
+                :key="account.wxid"
+                :label="account.wxid + (account.active ? '（当前绑定）' : '')"
+                :value="account.wxid"
+              />
+            </el-select>
+            <div class="hint">
+              当前绑定：{{ accountStatus.active || '未绑定' }}
+              <span v-if="accountStatus.bound_pid"> / PID {{ accountStatus.bound_pid }}</span>
+            </div>
+          </div>
+        </el-form-item>
+        <el-form-item label="发送模式">
+          <el-radio-group v-model="form.windows_sender.send_mode">
+            <el-radio label="auto">自动（后台优先）</el-radio>
+            <el-radio label="background">仅后台</el-radio>
+            <el-radio label="foreground">仅前台</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="后台按钮消息">
+          <el-switch v-model="form.windows_sender.background_post_message" />
+          <span class="inline-hint">仅对 UIA 已确认的发送按钮投递一次</span>
+        </el-form-item>
+        <el-form-item label="发送前回退前台">
+          <el-switch v-model="form.windows_sender.allow_foreground_activation" />
+          <span class="inline-hint">只在任何发送动作发生前允许</span>
+        </el-form-item>
+        <el-form-item label="UIA 状态">
+          <div style="width: 100%">
+            <el-button :loading="diagnosing" @click="diagnoseUIA">检测微信 UIA</el-button>
+            <el-tag v-if="uiaStatus" :type="uiaStatus.available ? 'success' : 'danger'" style="margin-left: 10px">
+              {{ uiaStatus.available ? '已就绪' : '不可用' }}
+            </el-tag>
+            <el-descriptions v-if="uiaStatus" :column="2" border size="small" style="margin-top: 12px">
+              <el-descriptions-item label="主窗口">{{ stateText(uiaStatus.main_window) }}</el-descriptions-item>
+              <el-descriptions-item label="搜索框">{{ stateText(uiaStatus.search_box) }}</el-descriptions-item>
+              <el-descriptions-item label="会话列表">{{ stateText(uiaStatus.session_list) }}</el-descriptions-item>
+              <el-descriptions-item label="输入框">{{ stateText(uiaStatus.chat_input) }}</el-descriptions-item>
+              <el-descriptions-item label="发送按钮">{{ stateText(uiaStatus.send_button) }}</el-descriptions-item>
+              <el-descriptions-item label="原因">{{ uiaStatus.reason || '-' }}</el-descriptions-item>
+            </el-descriptions>
+            <el-alert
+              v-if="uiaStatus?.help"
+              :title="uiaStatus.help"
+              type="info"
+              :closable="false"
+              show-icon
+              style="margin-top: 10px"
+            />
+          </div>
+        </el-form-item>
         <el-form-item>
           <el-button type="primary" @click="saveConfig" :loading="saving">保存配置</el-button>
         </el-form-item>
@@ -83,7 +152,16 @@
 
 <script setup lang="ts">
 import { reactive, ref, onMounted } from 'vue'
-import { getChatConfig, updateChatConfig, getContacts, searchChatrooms, searchContactsApi } from '../api'
+import {
+  getChatConfig,
+  updateChatConfig,
+  getContacts,
+  searchChatrooms,
+  searchContactsApi,
+  getWeChatAccounts,
+  selectWeChatAccount,
+  diagnoseWeChatUIA,
+} from '../api'
 import { ElMessage } from 'element-plus'
 
 const form = reactive<any>({
@@ -94,6 +172,11 @@ const form = reactive<any>({
   private_chat_mode: 'whitelist',
   private_whitelist: [],
   reply_mode: 'all',
+  windows_sender: {
+    send_mode: 'auto',
+    background_post_message: true,
+    allow_foreground_activation: true,
+  },
 })
 
 // 全量数据：用于已选标签的名称展示
@@ -107,6 +190,53 @@ const filteredContacts = ref<any[]>([])
 const selectedRoom = ref('')
 const selectedUser = ref('')
 const saving = ref(false)
+const accounts = ref<any[]>([])
+const accountsLoading = ref(false)
+const selectedAccount = ref('')
+const accountStatus = reactive<any>({ active: '', bound_pid: null })
+const diagnosing = ref(false)
+const uiaStatus = ref<any>(null)
+
+function stateText(value: boolean) {
+  return value ? '已找到' : '未找到'
+}
+
+async function loadAccounts() {
+  accountsLoading.value = true
+  try {
+    const res = await getWeChatAccounts()
+    accounts.value = res.data?.accounts || []
+    selectedAccount.value = res.data?.selected || ''
+    accountStatus.active = res.data?.active || ''
+    accountStatus.bound_pid = res.data?.bound_pid || null
+  } finally {
+    accountsLoading.value = false
+  }
+}
+
+async function changeAccount(wxid: string) {
+  if (!wxid) return
+  await selectWeChatAccount(wxid)
+  uiaStatus.value = null
+  accountStatus.active = ''
+  accountStatus.bound_pid = null
+  ElMessage.warning('账号已保存。请使用 WeixManager 重启服务，重启前自动发送保持静默。')
+}
+
+async function diagnoseUIA() {
+  diagnosing.value = true
+  try {
+    const res = await diagnoseWeChatUIA()
+    uiaStatus.value = res.data
+    if (res.data?.available) {
+      ElMessage.success('微信 UIA 关键控件已就绪')
+    } else {
+      ElMessage.warning(res.data?.reason || '微信 UIA 不可用')
+    }
+  } finally {
+    diagnosing.value = false
+  }
+}
 
 function roomName(id: string) {
   const found = allChatrooms.value.find((r: any) => r.room_id === id)
@@ -214,6 +344,16 @@ onMounted(async () => {
   } catch {
     ElMessage.error('加载联系人列表失败，请确认后端服务已启动')
   }
+
+  try {
+    await loadAccounts()
+  } catch {
+    ElMessage.error('加载微信账号列表失败')
+  }
+
+  if (window.location.hash.includes('diagnose=1')) {
+    await diagnoseUIA()
+  }
 })
 
 async function saveConfig() {
@@ -226,3 +366,17 @@ async function saveConfig() {
   }
 }
 </script>
+
+<style scoped>
+.hint {
+  margin-top: 6px;
+  color: #909399;
+  font-size: 12px;
+}
+
+.inline-hint {
+  margin-left: 10px;
+  color: #909399;
+  font-size: 12px;
+}
+</style>

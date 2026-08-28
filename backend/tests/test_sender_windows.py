@@ -8,6 +8,8 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pyautogui
@@ -50,11 +52,13 @@ def _make_sender():
     from app.core.windows_sender_calibration import ClientGeometry, default_calibration
 
     sender = WindowsSender()
+    sender._send_method = "legacy_coordinates"
     sender._window_activate_delay = 0
     sender._search_result_delay = 0
     sender._type_delay = 0
     sender._skip_search_ttl = 60
     sender._verify_after_send = False
+    sender._park_after_send = False
     sender._calibration = default_calibration("test", confirmed=True)
     sender._assert_calibration_ready = MagicMock()
     sender._get_active_client_geometry = MagicMock(
@@ -379,6 +383,259 @@ def test_find_wechat_window_accepts_minimized_main_window():
     assert window.title == "微信"
 
 
+class FakeUIAAdapter:
+    """只模拟 UIA 语义，不接触真实窗口、键盘或鼠标。"""
+
+    def __init__(self):
+        self.window = object()
+        self.input = object()
+        self.button = object()
+        self.activations = []
+        self.open_visible_calls = 0
+        self.search_calls = 0
+        self.post_calls = 0
+        self.invoke_calls = 0
+        self.visible_error = None
+        self.post_result = True
+        self.states = [(10, 20, 30, 40)] * 10
+        self.text = ""
+
+    def input_state(self):
+        return self.states.pop(0)
+
+    def main_window(self, pid, *, activate=False):
+        assert pid == 4321
+        self.activations.append(activate)
+        return self.window
+
+    def open_visible_session(self, window, receiver):
+        assert window is self.window
+        self.open_visible_calls += 1
+        if self.visible_error:
+            raise RuntimeError(self.visible_error)
+
+    def search_and_open(self, window, receiver, is_group):
+        assert window is self.window
+        self.search_calls += 1
+
+    def chat_input(self, window, receiver):
+        return self.input
+
+    def set_text(self, control, text, *, background):
+        self.text = text
+        return True
+
+    def read_text(self, control):
+        return self.text
+
+    def send_button(self, window, input_control):
+        return self.button
+
+    def post_send(self, window, button):
+        self.post_calls += 1
+        if self.post_result:
+            self.text = ""
+        return self.post_result
+
+    def invoke_send(self, button):
+        self.invoke_calls += 1
+        self.text = ""
+        return True
+
+
+def _uia_binding():
+    return {
+        "selected_account": "wxid_me",
+        "bound_account": "wxid_me",
+        "bound_pid": 4321,
+    }
+
+
+def test_uia_auto_prefers_background_and_posts_once():
+    from app.core.sender_windows_uia import WindowsUIASender
+
+    adapter = FakeUIAAdapter()
+    sender = WindowsUIASender(
+        adapter_factory=lambda: adapter,
+        binding_provider=_uia_binding,
+    )
+    sender._send_mode = "auto"
+
+    result = sender._send_text_sync_result(
+        "1", "测试群", True, "room@chatroom"
+    )
+
+    assert result.action_performed is True
+    assert result.status == "pending_verify"
+    assert result.method == "background"
+    assert adapter.open_visible_calls == 1
+    assert adapter.search_calls == 0
+    assert adapter.post_calls == 1
+    assert adapter.invoke_calls == 0
+
+
+def test_uia_auto_falls_back_foreground_only_before_send_action():
+    from app.core.sender_windows_uia import WindowsUIASender
+
+    adapter = FakeUIAAdapter()
+    adapter.visible_error = "可见会话不存在"
+    sender = WindowsUIASender(
+        adapter_factory=lambda: adapter,
+        binding_provider=_uia_binding,
+    )
+    sender._send_mode = "auto"
+
+    result = sender._send_text_sync_result(
+        "回复", "测试联系人", False, "wxid_friend"
+    )
+
+    assert result.action_performed is True
+    assert result.method == "foreground"
+    assert adapter.open_visible_calls == 1
+    assert adapter.search_calls == 1
+    assert adapter.post_calls == 0
+    assert adapter.invoke_calls == 1
+
+
+def test_uia_post_message_uncertain_never_switches_or_retries():
+    from app.core.sender_windows_uia import WindowsUIASender
+
+    adapter = FakeUIAAdapter()
+    adapter.post_result = False
+    sender = WindowsUIASender(
+        adapter_factory=lambda: adapter,
+        binding_provider=_uia_binding,
+    )
+    sender._send_mode = "auto"
+
+    result = sender._send_text_sync_result(
+        "只发一次", "测试群", True, "room@chatroom"
+    )
+
+    assert result.action_performed is True
+    assert result.status == "pending_verify"
+    assert adapter.post_calls == 1
+    assert adapter.search_calls == 0
+    assert adapter.invoke_calls == 0
+
+
+def test_uia_background_user_state_change_stops_without_foreground_fallback():
+    from app.core.sender_windows_uia import WindowsUIASender
+
+    adapter = FakeUIAAdapter()
+    adapter.states = [(10, 20, 30, 40), (11, 20, 30, 40)]
+    sender = WindowsUIASender(
+        adapter_factory=lambda: adapter,
+        binding_provider=_uia_binding,
+    )
+    sender._send_mode = "auto"
+
+    result = sender._send_text_sync_result(
+        "不应发送", "测试群", True, "room@chatroom"
+    )
+
+    assert result.error_code == "background_state_changed"
+    assert result.action_performed is False
+    assert adapter.post_calls == 0
+    assert adapter.search_calls == 0
+
+
+def test_uia_missing_or_mismatched_account_binding_fails_closed():
+    from app.core.sender_windows_uia import WindowsUIASender
+
+    adapter = FakeUIAAdapter()
+    sender = WindowsUIASender(
+        adapter_factory=lambda: adapter,
+        binding_provider=lambda: {
+            "selected_account": "wxid_a",
+            "bound_account": "wxid_b",
+            "bound_pid": 4321,
+        },
+    )
+
+    result = sender._send_text_sync_result(
+        "不应发送", "测试联系人", False, "wxid_friend"
+    )
+
+    assert result.error_code == "account_binding_unavailable"
+    assert result.action_performed is False
+    assert adapter.open_visible_calls == 0
+    assert adapter.search_calls == 0
+
+
+class FakeControl:
+    def __init__(self, *, name="", aid="", children=None):
+        self.Name = name
+        self.AutomationId = aid
+        self.ClassName = ""
+        self.ControlTypeName = "ListItemControl"
+        self.BoundingRectangle = SimpleNamespace(left=1, top=1, right=10, bottom=10)
+        self._children = list(children or [])
+
+    def GetChildren(self):
+        return self._children
+
+
+def _direct_adapter_without_import():
+    from app.core.sender_windows_uia import DirectUIAAdapter
+
+    adapter = object.__new__(DirectUIAAdapter)
+    adapter.search_box = MagicMock(return_value=FakeControl())
+    adapter.set_text = MagicMock(return_value=True)
+    adapter.invoke = MagicMock(return_value=True)
+    return adapter
+
+
+def test_direct_uia_search_ignores_result_order_and_wrong_sections():
+    """广告、聊天记录和结果顺序变化不能影响群聊精确选择。"""
+    adapter = _direct_adapter_without_import()
+    search_list = FakeControl(
+        aid="search_list",
+        children=[
+            FakeControl(name="聊天记录"),
+            FakeControl(name="测试群", aid="search_item_history"),
+            FakeControl(name="其他信息", aid="search_item_ad"),
+            FakeControl(name="群聊"),
+            FakeControl(name="测试群", aid="search_item_room"),
+        ],
+    )
+    window = FakeControl(children=[search_list])
+
+    adapter.search_and_open(window, "测试群", is_group=True)
+
+    adapter.invoke.assert_called_once_with(search_list.GetChildren()[-1])
+
+
+def test_direct_uia_search_rejects_same_type_duplicate_name():
+    adapter = _direct_adapter_without_import()
+    search_list = FakeControl(
+        aid="search_list",
+        children=[
+            FakeControl(name="群聊"),
+            FakeControl(name="重名群", aid="search_item_room_1"),
+            FakeControl(name="重名群", aid="search_item_room_2"),
+        ],
+    )
+    window = FakeControl(children=[search_list])
+
+    with pytest.raises(RuntimeError, match="重名"):
+        adapter.search_and_open(window, "重名群", is_group=True)
+
+    adapter.invoke.assert_not_called()
+
+
+def test_uia_sender_source_excludes_memory_write_ocr_and_mouse_fallback():
+    source = Path(
+        os.path.join(os.path.dirname(__file__), "..", "app", "core", "sender_windows_uia.py")
+    ).read_text(encoding="utf-8")
+
+    assert "WriteProcessMemory" not in source
+    assert "from wechatauto" not in source
+    assert "pyautogui" not in source
+    assert "import ocr" not in source.casefold()
+    assert "ocr_helper" not in source.casefold()
+
+
 def test_find_wechat_window_accepts_hidden_tray_main_window():
     """隐藏到托盘的微信主窗口仍应识别为在线。"""
     from app.core.sender_windows import WindowsSender
@@ -458,7 +715,7 @@ def test_global_lock_serialization():
     from app.core.sender_windows import WindowsSender
 
     lock = WindowsSender._gui_lock
-    assert isinstance(lock, threading.Lock)
+    assert isinstance(lock, type(threading.Lock()))
     assert lock.acquire(blocking=False)  # 锁未被持有
     lock.release()
 

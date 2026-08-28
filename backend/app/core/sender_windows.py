@@ -91,6 +91,7 @@ class WindowsSender(BaseMessageSender):
     def __init__(self):
         config = get_config()
         win_cfg = config.windows_sender if hasattr(config, "windows_sender") else {}
+        self._send_method = str(win_cfg.get("method", "uia") or "uia").strip().lower()
         self._type_delay = win_cfg.get("type_delay", 0.3)
         self._window_activate_delay = win_cfg.get("window_activate_delay", 0.5)
         self._search_result_delay = win_cfg.get("search_result_delay", 2.0)
@@ -105,6 +106,8 @@ class WindowsSender(BaseMessageSender):
         )
         self._calibration = load_calibration()
         self._confirmation_source = None
+        self._uia_sender = None
+        self._last_send_result = None
 
         self._last_receiver = ""
         self._last_send_time: float = 0.0
@@ -136,6 +139,16 @@ class WindowsSender(BaseMessageSender):
             logger.error("消息内容或接收者为空")
             return False
 
+        # 自动回复默认只走安全 UIA。旧坐标实现仅保留给显式配置的手工兼容
+        # 场景，UIA 失败时绝不会自动回退到鼠标或固定坐标。
+        if self._send_method != "legacy_coordinates":
+            return await self._send_text_uia(
+                msg,
+                receiver,
+                is_group=is_group,
+                target_id=target_id,
+            )
+
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             _executor,
@@ -159,8 +172,115 @@ class WindowsSender(BaseMessageSender):
         """打开指定聊天（用于发送后停靠）。"""
         if not receiver:
             return False
+        if self._send_method != "legacy_coordinates":
+            return await self._get_uia_sender().open_chat(receiver, is_group=False)
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(_executor, self._open_chat_sync, receiver)
+
+    async def prewarm_uia(self) -> dict:
+        """只读预热 UIA 树，不激活、不点击微信。"""
+        if self._send_method == "legacy_coordinates":
+            return {
+                "available": False,
+                "reason": "当前显式启用了旧坐标发送模式",
+            }
+        return await self._get_uia_sender().prewarm()
+
+    async def diagnose_uia(self) -> dict:
+        """返回账号/PID 绑定与关键 UIA 控件状态。"""
+        return await self._get_uia_sender().diagnose()
+
+    def refresh_policy(self) -> None:
+        """热更新 UIA 发送策略；发送次数限制始终硬编码为一次。"""
+        cfg = get_config().windows_sender if hasattr(get_config(), "windows_sender") else {}
+        self._send_method = str(cfg.get("method", "uia") or "uia").strip().lower()
+        if self._uia_sender is not None:
+            self._uia_sender.refresh_policy()
+
+    @property
+    def last_send_result(self):
+        return self._last_send_result
+
+    def _get_uia_sender(self):
+        if self._uia_sender is None:
+            from app.core.sender_windows_uia import WindowsUIASender
+
+            self._uia_sender = WindowsUIASender()
+        return self._uia_sender
+
+    async def _send_text_uia(
+        self,
+        msg: str,
+        receiver: str,
+        *,
+        is_group: bool,
+        target_id: str,
+    ) -> bool:
+        """执行一次 UIA 动作，再由现有监听器做最终数据库确认。"""
+        if not self._confirmation_is_available(target_id):
+            return False
+
+        confirmation = self._begin_send_confirmation(
+            msg,
+            int(time.time()) - 2,
+            target_id,
+        )
+        try:
+            result = await self._get_uia_sender().send_text_result(
+                msg,
+                receiver,
+                is_group,
+                target_id,
+            )
+            self._last_send_result = result
+            if not result.action_performed:
+                logger.error(
+                    "UIA 在发送动作前停止 | receiver=%s | target_id=%s | stage=%s | code=%s | error=%s",
+                    receiver,
+                    target_id,
+                    result.stage,
+                    result.error_code,
+                    result.error_message,
+                )
+                return False
+
+            confirmed = await asyncio.to_thread(self._verify_sent_text, confirmation)
+            if not confirmed:
+                result.pending(
+                    "db_verify",
+                    "db_confirmation_timeout",
+                    "发送动作已执行但数据库未确认；为避免重复发送已停止",
+                )
+                logger.error(
+                    "UIA 发送动作已执行但数据库回读未确认，已禁止补发 "
+                    "| receiver=%s | target_id=%s | method=%s",
+                    receiver,
+                    target_id,
+                    result.method,
+                )
+                self.reset_search_state()
+                return False
+
+            result.sent(method=result.method)
+            self._remember_current_chat(receiver)
+            if self._park_after_send and self._parking_receiver and receiver != self._parking_receiver:
+                parked = await self._get_uia_sender().open_chat(
+                    self._parking_receiver,
+                    is_group=False,
+                )
+                if not parked:
+                    logger.warning("UIA 发送后停靠失败，已清空会话状态")
+                    self.reset_search_state()
+            logger.info(
+                "UIA 消息发送并回读确认成功 | receiver=%s | target_id=%s | method=%s",
+                receiver,
+                target_id,
+                result.method,
+            )
+            return True
+        finally:
+            if confirmation is not None:
+                confirmation.cancel()
 
     def reset_search_state(self) -> None:
         """清空免搜索状态。"""

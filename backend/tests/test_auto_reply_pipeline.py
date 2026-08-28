@@ -146,6 +146,42 @@ def test_merge_chatroom_name_does_not_overwrite_existing_display_name():
     assert name_map["room@chatroom"] == "联系人表群名"
 
 
+def test_display_name_reverse_index_detects_cross_type_duplicates():
+    ambiguous = AutoReplyPipeline._find_ambiguous_display_names(
+        {
+            "wxid_friend": "同名目标",
+            "room@chatroom": "同名目标",
+            "wxid_other": "其他联系人",
+        }
+    )
+
+    assert ambiguous == {"同名目标".casefold()}
+
+
+@pytest.mark.asyncio
+async def test_send_reply_refuses_ambiguous_display_name():
+    sender = FakeSender()
+    pipeline = AutoReplyPipeline()
+    pipeline._sender = sender
+    pipeline._monitor = FakeMonitor()
+    pipeline._name_map = {
+        "wxid_friend": "同名目标",
+        "room@chatroom": "同名目标",
+    }
+    pipeline._ambiguous_display_names = pipeline._find_ambiguous_display_names(
+        pipeline._name_map
+    )
+
+    success = await pipeline._send_reply(
+        "不会发送",
+        "wxid_friend",
+        _private_msg(),
+    )
+
+    assert success is False
+    assert sender.sent == []
+
+
 def test_open_message_db_uses_platform_specific_reader():
     class FakeReader:
         def __init__(self):

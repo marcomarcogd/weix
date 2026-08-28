@@ -94,6 +94,9 @@ export const getContacts = (type: string = 'all') => api.get('/platform/contacts
 export const searchChatrooms = (keyword: string) => api.get('/platform/contacts', { params: { type: 'chatrooms', search: keyword } })
 export const searchContactsApi = (keyword: string) => api.get('/platform/contacts', { params: { type: 'contacts', search: keyword } })
 export const getPlatformStatus = () => api.get('/platform/status')
+export const getWeChatAccounts = () => api.get('/platform/accounts')
+export const selectWeChatAccount = (wxid: string) => api.put('/platform/account', { wxid })
+export const diagnoseWeChatUIA = () => api.get('/platform/uia/diagnose')
 
 // Health
 export const getHealth = () => api.get('/health')

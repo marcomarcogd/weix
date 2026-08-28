@@ -192,6 +192,151 @@ class WindowsKeyExtractor(BaseKeyExtractor):
         self._keys: dict[str, str] = {}
         self._all_keys_file = get_data_dir() / "all_keys.json"
         self._data_dirs_cache: Optional[list[str]] = None
+        self._bound_pid: Optional[int] = None
+        self._bound_account: str = ""
+
+    @property
+    def bound_pid(self) -> Optional[int]:
+        """返回已由数据库 salt/密钥确认归属的微信主进程。"""
+        return self._bound_pid
+
+    @property
+    def bound_account(self) -> str:
+        return self._bound_account
+
+    def selected_account(self) -> str:
+        """返回配置中选择的 Windows 微信账号目录名。"""
+        env_value = os.getenv("WEIX_WECHAT_ACCOUNT", "").strip()
+        if env_value:
+            return env_value
+        try:
+            from app.config import get_config
+
+            wechat_cfg = get_config().wechat
+            windows_cfg = (
+                wechat_cfg.get("windows", {}) if isinstance(wechat_cfg, dict) else {}
+            )
+            return str(windows_cfg.get("account", "") or "").strip()
+        except Exception:
+            return ""
+
+    def get_available_accounts(self) -> list[dict[str, object]]:
+        """列出包含 db_storage 的本机微信账号目录。"""
+        selected = self.selected_account().casefold()
+        accounts: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for data_root in self._find_wechat_data_dirs():
+            if os.path.isdir(os.path.join(data_root, "db_storage")):
+                root_name = os.path.basename(os.path.normpath(data_root))
+                normalized = root_name.casefold()
+                if normalized not in seen:
+                    seen.add(normalized)
+                    accounts.append(
+                        {
+                            "wxid": root_name,
+                            "data_dir": data_root,
+                            "selected": bool(selected and normalized == selected),
+                        }
+                    )
+                continue
+            try:
+                entries = list(os.scandir(data_root))
+            except OSError as exc:
+                logger.debug("枚举微信账号目录失败 (%s): %s", data_root, exc)
+                continue
+            for entry in entries:
+                if not entry.is_dir() or entry.name.casefold() == "all users":
+                    continue
+                if not os.path.isdir(os.path.join(entry.path, "db_storage")):
+                    continue
+                normalized = entry.name.casefold()
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                accounts.append(
+                    {
+                        "wxid": entry.name,
+                        "data_dir": entry.path,
+                        "selected": bool(selected and normalized == selected),
+                    }
+                )
+        accounts.sort(key=lambda item: str(item["wxid"]).casefold())
+        return accounts
+
+    def clear_process_binding(self) -> None:
+        self._bound_pid = None
+        self._bound_account = ""
+
+    def _effective_account(self) -> str:
+        selected = self.selected_account()
+        if selected:
+            return selected
+        accounts = self.get_available_accounts()
+        return str(accounts[0]["wxid"]) if len(accounts) == 1 else ""
+
+    def _db_belongs_to_selected_account(self, db_path: str) -> bool:
+        account = self._effective_account().casefold()
+        if not account:
+            return False
+        return account in {
+            part.casefold()
+            for part in os.path.normpath(db_path).split(os.sep)
+            if part
+        }
+
+    def bind_process_for_cached_keys(self, pid: int) -> bool:
+        """以目标账号数据库 salt 验证缓存密钥属于指定主进程。"""
+        if not self._keys:
+            self.load_keys()
+        if not self._keys:
+            return False
+        account = self._effective_account()
+        if not account:
+            logger.error("发现多个微信账号但尚未选择，拒绝绑定任意进程")
+            return False
+
+        h_process = self._open_process(pid)
+        if not h_process:
+            return False
+        try:
+            started_at = time.monotonic()
+            addresses = self._get_memory_regions(h_process, self._get_system_info())
+            db_infos = self._collect_validation_dbs()
+            salt_to_infos: dict[str, list[dict[str, object]]] = {}
+            for info in db_infos:
+                salt_to_infos.setdefault(str(info["salt"]), []).append(info)
+            found, _count, cancelled = self._scan_config_cipher_keys(
+                h_process,
+                addresses,
+                salt_to_infos,
+                started_at,
+                None,
+            )
+            if cancelled or not self._has_message_key(found):
+                return False
+            self._bound_pid = int(pid)
+            self._bound_account = account
+            logger.info("微信账号与主进程绑定成功: account=%s pid=%s", account, pid)
+            return True
+        finally:
+            self._kernel32.CloseHandle(h_process)
+
+    def bind_cached_keys_to_processes(self, pids: list[int]) -> bool:
+        """只在一个主进程能匹配所选账号时建立绑定。"""
+        matches: list[tuple[int, str]] = []
+        for pid in pids:
+            self.clear_process_binding()
+            if self.bind_process_for_cached_keys(int(pid)):
+                matches.append((int(pid), self._bound_account))
+        self.clear_process_binding()
+        if len(matches) != 1:
+            logger.error(
+                "微信账号/进程绑定不唯一，自动回复保持静默: matches=%s",
+                [(pid, account) for pid, account in matches],
+            )
+            return False
+        self._bound_pid, self._bound_account = matches[0]
+        return True
 
     def _setup_ctypes(self):
         """配置 ctypes 函数签名，防止 64 位系统指针截断。"""
@@ -362,6 +507,11 @@ class WindowsKeyExtractor(BaseKeyExtractor):
         """
         logger.info(f"开始扫描进程 {pid} 的内存...")
 
+        account = self._effective_account()
+        if not account:
+            logger.error("发现多个微信账号但尚未选择，拒绝扫描并绑定任意进程")
+            return {}
+
         h_process = self._open_process(pid)
         if not h_process:
             return {}
@@ -515,6 +665,8 @@ class WindowsKeyExtractor(BaseKeyExtractor):
 
             if found_keys:
                 self._keys = found_keys
+                self._bound_pid = int(pid)
+                self._bound_account = account
                 self._save_keys()
             else:
                 self._log_windows_4x_key_info_hint(db_infos)
@@ -1189,6 +1341,8 @@ class WindowsKeyExtractor(BaseKeyExtractor):
                         if not lower.endswith(".db") or lower.endswith(("-wal", "-shm")):
                             continue
                         full_path = os.path.join(root, fname)
+                        if not self._db_belongs_to_selected_account(full_path):
+                            continue
                         key = os.path.normcase(os.path.normpath(full_path))
                         if key in seen:
                             continue
@@ -1419,6 +1573,7 @@ class WindowsKeyExtractor(BaseKeyExtractor):
     def clear_keys(self) -> None:
         """清空内存和磁盘上的密钥缓存。"""
         self._keys = {}
+        self.clear_process_binding()
         try:
             self._all_keys_file.unlink(missing_ok=True)
         except OSError as exc:

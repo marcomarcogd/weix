@@ -86,6 +86,7 @@ FRONTEND_HOST = "127.0.0.1"
 FRONTEND_PORT = 5173
 BACKEND_HEALTH_URL = f"http://{BACKEND_HOST}:{BACKEND_PORT}/api/health"
 FRONTEND_URL = f"http://{FRONTEND_HOST}:{FRONTEND_PORT}/"
+UIA_DIAGNOSE_URL = f"{FRONTEND_URL}#/chat-config?diagnose=1"
 STARTUP_TIMEOUT_SECONDS = 150.0
 GRACEFUL_STOP_TIMEOUT_SECONDS = 20.0
 LOG_MAX_BYTES = 10 * 1024 * 1024
@@ -1417,7 +1418,7 @@ class MainWindow(QMainWindow):
         self._btn_restart = QPushButton("重启")
         self._btn_recognize = QPushButton("识别服务")
         self._btn_browser = QPushButton("打开网页")
-        self._btn_calibrate = QPushButton("微信点击校准")
+        self._btn_calibrate = QPushButton("检测微信 UIA")
         self._btn_clear_view = QPushButton("清空显示")
         self._btn_clear_files = QPushButton("清理日志文件")
         self._btn_start.clicked.connect(self._begin_start)
@@ -1425,7 +1426,7 @@ class MainWindow(QMainWindow):
         self._btn_restart.clicked.connect(self._begin_restart)
         self._btn_recognize.clicked.connect(self._recognize_existing_services)
         self._btn_browser.clicked.connect(self._open_browser)
-        self._btn_calibrate.clicked.connect(self._begin_calibration)
+        self._btn_calibrate.clicked.connect(self._open_uia_diagnosis)
         self._btn_clear_view.clicked.connect(self._clear_log_view)
         self._btn_clear_files.clicked.connect(self._clear_log_files)
         for button in (
@@ -1526,9 +1527,7 @@ class MainWindow(QMainWindow):
             state in (ServiceState.STOPPED, ServiceState.PARTIAL, ServiceState.ERROR)
         )
         self._btn_browser.setEnabled(browser_enabled)
-        self._btn_calibrate.setEnabled(
-            state == ServiceState.STOPPED and not any_process_running
-        )
+        self._btn_calibrate.setEnabled(frontend_running and backend_running)
         self._tray_start.setEnabled(start_enabled)
         self._tray_stop.setEnabled(stop_enabled)
         self._tray_restart.setEnabled(restart_enabled)
@@ -1806,6 +1805,22 @@ class MainWindow(QMainWindow):
                 )
 
         QTimer.singleShot(400, capture)
+
+    def _open_uia_diagnosis(self) -> None:
+        """在已登录的管理页面执行只读 UIA 检测。"""
+        backend_running, frontend_running = self._controller.process_status()
+        if not backend_running or not frontend_running:
+            QMessageBox.warning(
+                self,
+                "无法检测",
+                "请先启动并确认前端、后端都处于运行状态。",
+            )
+            return
+        webbrowser.open(UIA_DIAGNOSE_URL)
+        self._controller.log(
+            "manager",
+            "已打开聊天配置中的微信 UIA 检测；检测过程不会输入或发送消息",
+        )
 
     @staticmethod
     def _open_browser() -> None:

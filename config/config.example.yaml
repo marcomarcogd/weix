@@ -56,6 +56,10 @@ macos_sender:
   window_activate_delay: 0.5
 
 windows_sender:
+  method: uia
+  send_mode: auto
+  background_post_message: true
+  allow_foreground_activation: true
   click_x_ratio: 0.5
   click_y_ratio: 0.88
   park_after_send: true
@@ -100,6 +104,7 @@ wechat:
     data_dir: auto
     version: 4.x
   windows:
+    account: ""
     data_dir: auto
     version: 3.9.12.51
 

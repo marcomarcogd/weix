@@ -54,6 +54,7 @@ class AutoReplyPipeline:
         self._workflow_engine = None
         self._ai_agent = None  # WeixAgent 实例（延迟初始化）
         self._name_map: dict[str, str] = {}  # wxid -> 显示名
+        self._ambiguous_display_names: set[str] = set()
         self._task: Optional[asyncio.Task] = None
         self._running = False
         # 消息防抖缓冲: sender_key -> [messages]
@@ -110,6 +111,14 @@ class AutoReplyPipeline:
 
         # 3. 构建名称映射 (wxid -> 显示名，用于 AppleScript 搜索)
         self._name_map = self._build_name_map(platform, keys)
+        self._ambiguous_display_names = self._find_ambiguous_display_names(
+            self._name_map
+        )
+        if self._ambiguous_display_names:
+            logger.warning(
+                "检测到 %d 个联系人/群聊重名；相关会话将拒绝自动发送",
+                len(self._ambiguous_display_names),
+            )
 
         # 4. 仅回填今天的本地统计，不进入自动回复队列。
         await self._backfill_today_messages(msg_reader)
@@ -119,6 +128,15 @@ class AutoReplyPipeline:
         await self._monitor.start(lookback_seconds=300.0)
         if hasattr(self._sender, "set_confirmation_source"):
             self._sender.set_confirmation_source(self._monitor)
+        if platform.is_windows and hasattr(self._sender, "prewarm_uia"):
+            diagnosis = await self._sender.prewarm_uia()
+            if diagnosis.get("available"):
+                logger.info("Windows UIA 已只读预热完成")
+            else:
+                logger.warning(
+                    "Windows UIA 尚不可用，自动发送将保持静默: %s",
+                    diagnosis.get("reason", "未知原因"),
+                )
 
         # 6. 加载规则引擎 (先从 YAML 同步到 DB)
         from app.workflow.rule_engine import RuleEngine
@@ -373,6 +391,25 @@ class AutoReplyPipeline:
         if current and not current.endswith("@chatroom"):
             return
         name_map[room_id] = name or current or room_id
+
+    @staticmethod
+    def _normalize_display_name(name: str) -> str:
+        return str(name or "").strip().casefold()
+
+    @classmethod
+    def _find_ambiguous_display_names(cls, name_map: dict[str, str]) -> set[str]:
+        """建立跨联系人/群聊的显示名反向索引。"""
+        targets: dict[str, set[str]] = {}
+        for target_id, display_name in name_map.items():
+            normalized = cls._normalize_display_name(display_name)
+            if not normalized:
+                continue
+            targets.setdefault(normalized, set()).add(str(target_id))
+        return {
+            display_name
+            for display_name, target_ids in targets.items()
+            if len(target_ids) > 1
+        }
 
     # ------------------------------------------------------------------
     # Internal: 规则初始化
@@ -705,6 +742,16 @@ class AutoReplyPipeline:
             return False
 
         display_name = self._name_map.get(receiver, receiver)
+        normalized_display_name = self._normalize_display_name(display_name)
+        if normalized_display_name in self._ambiguous_display_names:
+            logger.error(
+                "接收者显示名与其他联系人或群聊重名，拒绝自动发送 "
+                "| receiver=%s | display_name=%s | is_group=%s",
+                receiver,
+                display_name,
+                msg.is_group,
+            )
+            return False
         if self._is_unsearchable_name(display_name):
             logger.error(
                 "接收者名称无法搜索，拒绝自动发送 | receiver=%s | display_name=%s | is_group=%s",

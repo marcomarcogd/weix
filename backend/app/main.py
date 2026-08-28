@@ -33,6 +33,28 @@ def _try_auto_extract_keys():
         platform = Platform.get()
         extractor = platform.key_extractor
 
+        if hasattr(extractor, "get_available_accounts"):
+            accounts = extractor.get_available_accounts()
+            selected = (
+                extractor.selected_account()
+                if hasattr(extractor, "selected_account")
+                else ""
+            )
+            if len(accounts) > 1 and not selected:
+                logger.error(
+                    "检测到多个微信账号，请先在聊天配置中选择账号；自动回复保持静默"
+                )
+                return
+
+        pids = (
+            extractor.find_wechat_processes()
+            if hasattr(extractor, "find_wechat_processes")
+            else [pid] if (pid := extractor.find_wechat_process()) else []
+        )
+        if not pids:
+            logger.warning("未找到微信进程，跳过密钥提取")
+            return
+
         # 缓存存在时先验证，避免旧/错误密钥导致后续数据库打开失败。
         cache = get_data_dir() / "all_keys.json"
         if cache.exists():
@@ -48,6 +70,13 @@ def _try_auto_extract_keys():
                 else bool(valid_keys)
             )
             if valid_keys and has_message_key:
+                if hasattr(extractor, "bind_cached_keys_to_processes"):
+                    if not extractor.bind_cached_keys_to_processes(pids):
+                        logger.error(
+                            "缓存密钥有效，但无法唯一绑定所选账号与微信主进程；"
+                            "自动回复保持静默"
+                        )
+                        return
                 logger.info("密钥已缓存且验证通过，跳过提取")
                 return
             logger.warning("缓存密钥无法解密当前数据库，删除后重新提取")
@@ -59,23 +88,25 @@ def _try_auto_extract_keys():
                 except OSError as exc:
                     logger.warning(f"删除无效密钥缓存失败: {exc}")
 
-        pids = (
-            extractor.find_wechat_processes()
-            if hasattr(extractor, "find_wechat_processes")
-            else [pid] if (pid := extractor.find_wechat_process()) else []
-        )
-        if not pids:
-            logger.warning("未找到微信进程，跳过密钥提取")
-            return
-
         keys = {}
         for pid in pids:
             if _shutdown_event.is_set():
                 break
             logger.info(f"正在从微信进程 {pid} 提取密钥...")
-            keys = extractor.scan_memory_for_keys(pid, stop_event=_shutdown_event)
-            if keys:
+            candidate_keys = extractor.scan_memory_for_keys(
+                pid,
+                stop_event=_shutdown_event,
+            )
+            has_message_key = (
+                extractor._has_message_key(candidate_keys)
+                if hasattr(extractor, "_has_message_key")
+                else bool(candidate_keys)
+            )
+            if candidate_keys and has_message_key:
+                keys = candidate_keys
                 break
+            if hasattr(extractor, "clear_process_binding"):
+                extractor.clear_process_binding()
         if _shutdown_event.is_set():
             logger.info("密钥提取已取消")
             return

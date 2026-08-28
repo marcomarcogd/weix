@@ -123,16 +123,50 @@ def _prune_rules_for_removed_rooms(
     ]
 
 
+def _normalize_windows_sender(value) -> dict:
+    """只接受安全 UIA 策略字段；发送次数固定为一次。"""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise HTTPException(422, "Windows 发送配置格式错误")
+    mode = str(value.get("send_mode", "auto") or "auto").strip().lower()
+    if mode not in {"auto", "background", "foreground"}:
+        raise HTTPException(422, "Windows 发送模式必须是自动、仅后台或仅前台")
+    return {
+        "method": "uia",
+        "send_mode": mode,
+        "background_post_message": bool(value.get("background_post_message", True)),
+        "allow_foreground_activation": bool(
+            value.get("allow_foreground_activation", True)
+        ),
+    }
+
+
 # --- Chat Config ---
 @router.get("/config/chat")
 async def get_chat_config():
-    return get_config().auto_reply
+    cfg = get_config()
+    return {
+        **cfg.auto_reply,
+        "windows_sender": {
+            "send_mode": str(cfg.windows_sender.get("send_mode", "auto") or "auto"),
+            "background_post_message": bool(
+                cfg.windows_sender.get("background_post_message", True)
+            ),
+            "allow_foreground_activation": bool(
+                cfg.windows_sender.get("allow_foreground_activation", True)
+            ),
+        },
+    }
 
 
 @router.put("/config/chat")
 async def update_chat_config(data: dict):
     cfg = get_config()
     normalized_data = dict(data)
+    windows_sender = _normalize_windows_sender(
+        normalized_data.pop("windows_sender", None)
+    )
     if "group_reply_rules" in normalized_data or "group_whitelist" in normalized_data:
         effective_whitelist = normalized_data.get(
             "group_whitelist",
@@ -158,6 +192,8 @@ async def update_chat_config(data: dict):
         with open(config_path, "r", encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
         raw.setdefault("auto_reply", {}).update(normalized_data)
+        if windows_sender:
+            raw.setdefault("windows_sender", {}).update(windows_sender)
         with open(config_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(raw, f, allow_unicode=True, default_flow_style=False)
     except Exception as e:
@@ -165,6 +201,17 @@ async def update_chat_config(data: dict):
 
     # 文件保存成功后再更新进程内配置，群聊专属规则可立即生效。
     cfg.auto_reply.update(normalized_data)
+    if windows_sender:
+        cfg.windows_sender.update(windows_sender)
+        try:
+            from app.core.platform import Platform
+
+            platform = Platform.get()
+            sender = getattr(platform, "_sender", None)
+            if sender is not None and hasattr(sender, "refresh_policy"):
+                sender.refresh_policy()
+        except Exception:
+            pass
     return {"success": True}
 
 
