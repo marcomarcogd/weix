@@ -211,8 +211,11 @@ class CalibrationMarker(QGraphicsEllipseItem):
 
 
 class CalibrationCanvas(QGraphicsView):
+    zoom_changed = pyqtSignal(int)
+
     def __init__(self, pixmap: QPixmap, points: dict[str, tuple[float, float]]):
         super().__init__()
+        self._fit_mode = True
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
         self._scene.addItem(QGraphicsPixmapItem(pixmap))
@@ -236,12 +239,50 @@ class CalibrationCanvas(QGraphicsView):
             self._scene.addItem(marker)
             self._markers[name] = marker
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setTransformationAnchor(
+            QGraphicsView.ViewportAnchor.AnchorUnderMouse
+        )
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setMinimumHeight(360)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        if self._fit_mode:
+            self.fit_to_view()
+
+    def wheelEvent(self, event) -> None:
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.zoom_by(1.2 if event.angleDelta().y() > 0 else 1 / 1.2)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+    def fit_to_view(self) -> None:
+        self.resetTransform()
+        self.fitInView(
+            self._scene.sceneRect(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+        )
+        self._fit_mode = True
+        self._emit_zoom()
+
+    def actual_size(self) -> None:
+        self.resetTransform()
+        self._fit_mode = False
+        self._emit_zoom()
+
+    def zoom_by(self, factor: float) -> None:
+        current = float(self.transform().m11())
+        if current <= 0:
+            return
+        target = min(4.0, max(0.15, current * float(factor)))
+        self.scale(target / current, target / current)
+        self._fit_mode = False
+        self._emit_zoom()
+
+    def _emit_zoom(self) -> None:
+        self.zoom_changed.emit(round(float(self.transform().m11()) * 100))
 
     def point(self, name: str) -> tuple[float, float]:
         position = self._markers[name].scenePos()
@@ -353,7 +394,8 @@ class CalibrationDialog(QDialog):
         self._wechat_version = wechat_version
         self.saved_path: Optional[Path] = None
         self.setWindowTitle("微信点击校准（只读预览）")
-        self.resize(1080, 820)
+        self.setMinimumSize(1050, 680)
+        self.resize(1500, 920)
 
         seed = _seed_calibration_from_config(project_root, wechat_version)
         fallback_seed = default_calibration(wechat_version, confirmed=False)
@@ -372,17 +414,43 @@ class CalibrationDialog(QDialog):
         layout = QVBoxLayout(self)
         instruction = QLabel(
             "请确认预览确实是微信，并把圆点拖到对应控件中央。"
-            "截图只保存在内存中，不会写入磁盘；保存的文件只有坐标和微信版本。"
+            "可点击“100%”查看原始文字，按住 Ctrl 滚动鼠标滚轮也可缩放；"
+            "在空白处拖动可平移画面。截图只保存在内存中，不会写入磁盘。"
         )
         instruction.setWordWrap(True)
         layout.addWidget(instruction)
 
         self._main_canvas = CalibrationCanvas(screenshot, positions)
-        layout.addWidget(self._main_canvas, stretch=1)
-
-        menu_group = QGroupBox(
-            "右键菜单相对位置（运行时还会验证菜单属于同一个 Weixin 进程）"
+        preview_layout = QHBoxLayout()
+        main_layout = QVBoxLayout()
+        zoom_layout = QHBoxLayout()
+        zoom_title = QLabel("微信客户区预览")
+        zoom_title.setFont(QFont("Microsoft YaHei", 10, QFont.Weight.Bold))
+        self._zoom_label = QLabel("缩放：--%")
+        zoom_out = QPushButton("缩小")
+        zoom_in = QPushButton("放大")
+        zoom_actual = QPushButton("100%")
+        zoom_fit = QPushButton("适合窗口")
+        zoom_out.clicked.connect(lambda: self._main_canvas.zoom_by(1 / 1.25))
+        zoom_in.clicked.connect(lambda: self._main_canvas.zoom_by(1.25))
+        zoom_actual.clicked.connect(self._main_canvas.actual_size)
+        zoom_fit.clicked.connect(self._main_canvas.fit_to_view)
+        self._main_canvas.zoom_changed.connect(
+            lambda value: self._zoom_label.setText(f"缩放：{value}%")
         )
+        zoom_layout.addWidget(zoom_title)
+        zoom_layout.addStretch()
+        zoom_layout.addWidget(self._zoom_label)
+        zoom_layout.addWidget(zoom_out)
+        zoom_layout.addWidget(zoom_in)
+        zoom_layout.addWidget(zoom_actual)
+        zoom_layout.addWidget(zoom_fit)
+        main_layout.addLayout(zoom_layout)
+        main_layout.addWidget(self._main_canvas, stretch=1)
+        preview_layout.addLayout(main_layout, stretch=1)
+
+        menu_group = QGroupBox("右键粘贴菜单校准")
+        menu_group.setFixedWidth(330)
         menu_layout = QVBoxLayout(menu_group)
         self._menu_canvas = CalibrationCanvas(
             _menu_preview_pixmap(),
@@ -393,9 +461,18 @@ class CalibrationDialog(QDialog):
                 )
             },
         )
-        self._menu_canvas.setMaximumHeight(190)
+        self._menu_canvas.setMinimumHeight(220)
+        self._menu_canvas.setMaximumHeight(260)
         menu_layout.addWidget(self._menu_canvas)
-        layout.addWidget(menu_group)
+        menu_hint = QLabel(
+            "把圆点拖到“粘贴”文字中央。运行时仍会验证菜单属于同一个 "
+            "Weixin 进程。"
+        )
+        menu_hint.setWordWrap(True)
+        menu_layout.addWidget(menu_hint)
+        menu_layout.addStretch()
+        preview_layout.addWidget(menu_group)
+        layout.addLayout(preview_layout, stretch=1)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
