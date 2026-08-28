@@ -145,7 +145,7 @@ def test_windows_account_discovery_accepts_non_wxid_directory(monkeypatch, tmp_p
     assert accounts[0]["selected"] is True
 
 
-def test_chat_config_only_persists_safe_uia_policy_fields(monkeypatch, tmp_path):
+def test_chat_config_only_persists_allowlisted_uia_policy_fields(monkeypatch, tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         "auto_reply:\n  enabled: false\nwindows_sender:\n  verify_timeout: 30\n",
@@ -170,6 +170,7 @@ def test_chat_config_only_persists_safe_uia_policy_fields(monkeypatch, tmp_path)
                     "send_mode": "background",
                     "background_post_message": True,
                     "allow_foreground_activation": False,
+                    "hot_activate_accessibility": True,
                     "send_retries": 99,
                     "mouse_fallback": True,
                 },
@@ -185,5 +186,30 @@ def test_chat_config_only_persists_safe_uia_policy_fields(monkeypatch, tmp_path)
         "send_mode": "background",
         "background_post_message": True,
         "allow_foreground_activation": False,
+        "hot_activate_accessibility": True,
     }
     assert cfg.auto_reply["enabled"] is True
+
+
+def test_activate_uia_api_uses_explicit_sender_action(monkeypatch):
+    calls = []
+
+    async def activate_uia():
+        calls.append("activate")
+        return {
+            "ok": True,
+            "status": "activated",
+            "wrote_memory": True,
+        }
+
+    platform = SimpleNamespace(
+        is_windows=True,
+        sender=SimpleNamespace(activate_uia=activate_uia),
+    )
+    monkeypatch.setattr(platform_api.Platform, "get", lambda: platform)
+
+    result = asyncio.run(platform_api.activate_uia())
+
+    assert result["ok"] is True
+    assert result["wrote_memory"] is True
+    assert calls == ["activate"]

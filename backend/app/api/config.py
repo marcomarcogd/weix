@@ -124,7 +124,7 @@ def _prune_rules_for_removed_rooms(
 
 
 def _normalize_windows_sender(value) -> dict:
-    """只接受安全 UIA 策略字段；发送次数固定为一次。"""
+    """只接受白名单内的 UIA 策略字段；发送次数固定为一次。"""
     if value is None:
         return {}
     if not isinstance(value, dict):
@@ -138,6 +138,10 @@ def _normalize_windows_sender(value) -> dict:
         "background_post_message": bool(value.get("background_post_message", True)),
         "allow_foreground_activation": bool(
             value.get("allow_foreground_activation", True)
+        ),
+        # 涉及 Weixin.dll 运行时单字节写入，必须由用户显式开启。
+        "hot_activate_accessibility": bool(
+            value.get("hot_activate_accessibility", False)
         ),
     }
 
@@ -155,6 +159,9 @@ async def get_chat_config():
             ),
             "allow_foreground_activation": bool(
                 cfg.windows_sender.get("allow_foreground_activation", True)
+            ),
+            "hot_activate_accessibility": bool(
+                cfg.windows_sender.get("hot_activate_accessibility", False)
             ),
         },
     }

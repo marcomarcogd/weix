@@ -460,6 +460,7 @@ def test_uia_auto_prefers_background_and_posts_once():
         binding_provider=_uia_binding,
     )
     sender._send_mode = "auto"
+    sender._hot_activate_accessibility = False
 
     result = sender._send_text_sync_result(
         "1", "测试群", True, "room@chatroom"
@@ -484,6 +485,7 @@ def test_uia_auto_falls_back_foreground_only_before_send_action():
         binding_provider=_uia_binding,
     )
     sender._send_mode = "auto"
+    sender._hot_activate_accessibility = False
 
     result = sender._send_text_sync_result(
         "回复", "测试联系人", False, "wxid_friend"
@@ -507,6 +509,7 @@ def test_uia_post_message_uncertain_never_switches_or_retries():
         binding_provider=_uia_binding,
     )
     sender._send_mode = "auto"
+    sender._hot_activate_accessibility = False
 
     result = sender._send_text_sync_result(
         "只发一次", "测试群", True, "room@chatroom"
@@ -529,6 +532,7 @@ def test_uia_background_user_state_change_stops_without_foreground_fallback():
         binding_provider=_uia_binding,
     )
     sender._send_mode = "auto"
+    sender._hot_activate_accessibility = False
 
     result = sender._send_text_sync_result(
         "不应发送", "测试群", True, "room@chatroom"
@@ -552,6 +556,7 @@ def test_uia_missing_or_mismatched_account_binding_fails_closed():
             "bound_pid": 4321,
         },
     )
+    sender._hot_activate_accessibility = False
 
     result = sender._send_text_sync_result(
         "不应发送", "测试联系人", False, "wxid_friend"
@@ -667,6 +672,108 @@ def test_direct_uia_main_window_rejects_unrelated_uia_class():
     assert captured.value.code == "uia_identity_mismatch"
 
 
+def test_uia_hot_activator_writes_only_verified_zero_byte():
+    from app.core.sender_windows_uia import AccessibilityHotActivator
+
+    driver = SimpleNamespace(
+        _weixin_dll_module=MagicMock(
+            return_value=(0x10000000, 0x200000, r"C:\Weixin\4.1.13.12\Weixin.dll")
+        ),
+        _qaccessible_active_rva=MagicMock(return_value=0x1234),
+        _read_process_byte=MagicMock(side_effect=[0, 1]),
+        _write_process_byte=MagicMock(return_value=True),
+    )
+    kernel32 = SimpleNamespace(
+        OpenProcess=MagicMock(return_value=987),
+        CloseHandle=MagicMock(return_value=True),
+    )
+    activator = AccessibilityHotActivator(driver_cls=driver, kernel32=kernel32)
+
+    with patch("win32process.GetWindowThreadProcessId", return_value=(1, 4321)):
+        result = activator.activate(123, 4321)
+
+    assert result["ok"] is True
+    assert result["status"] == "activated"
+    assert result["wrote_memory"] is True
+    driver._write_process_byte.assert_called_once_with(987, 0x10001234, 1)
+    assert driver._read_process_byte.call_count == 2
+    kernel32.CloseHandle.assert_called_once_with(987)
+
+
+def test_uia_hot_activator_rejects_unexpected_gate_value_without_write():
+    from app.core.sender_windows_uia import AccessibilityHotActivator
+
+    driver = SimpleNamespace(
+        _weixin_dll_module=MagicMock(
+            return_value=(0x10000000, 0x200000, r"C:\Weixin\4.1.13.12\Weixin.dll")
+        ),
+        _qaccessible_active_rva=MagicMock(return_value=0x1234),
+        _read_process_byte=MagicMock(return_value=7),
+        _write_process_byte=MagicMock(),
+    )
+    kernel32 = SimpleNamespace(
+        OpenProcess=MagicMock(return_value=987),
+        CloseHandle=MagicMock(return_value=True),
+    )
+    activator = AccessibilityHotActivator(driver_cls=driver, kernel32=kernel32)
+
+    with patch("win32process.GetWindowThreadProcessId", return_value=(1, 4321)):
+        result = activator.activate(123, 4321)
+
+    assert result["ok"] is False
+    assert result["status"] == "unexpected_value"
+    assert result["wrote_memory"] is False
+    driver._write_process_byte.assert_not_called()
+
+
+def test_uia_hot_activation_requires_explicit_opt_in():
+    from app.core.sender_windows_uia import WindowsUIASender
+
+    adapter = MagicMock()
+    sender = WindowsUIASender(
+        adapter_factory=lambda: adapter,
+        binding_provider=_uia_binding,
+    )
+    sender._hot_activate_accessibility = False
+
+    result = sender._activate_accessibility_sync()
+
+    assert result["ok"] is False
+    assert result["status"] == "disabled"
+    assert result["attempted"] is False
+    adapter.hot_activate_accessibility.assert_not_called()
+
+
+def test_uia_hot_activation_rechecks_controls_after_single_write():
+    from app.core.sender_windows_uia import WindowsUIASender
+
+    shell = SimpleNamespace(ClassName="Qt51514QWindowIcon")
+    adapter = MagicMock()
+    adapter.main_window.return_value = shell
+    adapter.search_box.side_effect = [RuntimeError("missing"), object()]
+    adapter.session_list.return_value = object()
+    adapter.hot_activate_accessibility.return_value = {
+        "ok": True,
+        "attempted": True,
+        "status": "activated",
+        "reason": "已完成 UIA gate 单字节热激活",
+        "wrote_memory": True,
+        "dll_version": "4.1.13.12",
+    }
+    sender = WindowsUIASender(
+        adapter_factory=lambda: adapter,
+        binding_provider=_uia_binding,
+    )
+    sender._hot_activate_accessibility = True
+
+    with patch("app.core.sender_windows_uia.time.sleep", return_value=None):
+        result = sender._activate_accessibility_sync()
+
+    assert result["ok"] is True
+    assert result["status"] == "activated"
+    adapter.hot_activate_accessibility.assert_called_once_with(shell, 4321)
+
+
 def test_uia_diagnosis_distinguishes_missing_visible_window():
     from app.core.sender_windows_uia import UIAWindowError, WindowsUIASender
 
@@ -773,13 +880,13 @@ def test_direct_uia_search_rejects_same_type_duplicate_name():
     adapter.invoke.assert_not_called()
 
 
-def test_uia_sender_source_excludes_memory_write_ocr_and_mouse_fallback():
+def test_uia_sender_source_keeps_hot_activation_opt_in_without_ocr_or_mouse_fallback():
     source = Path(
         os.path.join(os.path.dirname(__file__), "..", "app", "core", "sender_windows_uia.py")
     ).read_text(encoding="utf-8")
 
-    assert "WriteProcessMemory" not in source
-    assert "from wechatauto" not in source
+    assert 'cfg.get("hot_activate_accessibility", False)' in source
+    assert "from wechatauto.uia_driver import WeChatUIA" in source
     assert "pyautogui" not in source
     assert "import ocr" not in source.casefold()
     assert "ocr_helper" not in source.casefold()

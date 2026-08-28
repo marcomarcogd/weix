@@ -274,3 +274,15 @@ async def diagnose_uia():
             "请在 Windows 中开启并关闭一次“讲述人”，然后保持微信主窗口已登录并重新检测。"
         )
     return result
+
+
+@router.post("/uia/activate")
+async def activate_uia():
+    """按已保存的显式授权执行一次 UIA gate 热激活。"""
+    platform = Platform.get()
+    if not platform.is_windows:
+        raise HTTPException(400, "UIA 热激活仅适用于 Windows")
+    sender = platform.sender
+    if not hasattr(sender, "activate_uia"):
+        raise HTTPException(503, "当前 Windows 发送器不支持 UIA 热激活")
+    return await sender.activate_uia()

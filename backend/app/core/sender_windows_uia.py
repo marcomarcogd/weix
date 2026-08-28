@@ -1,7 +1,8 @@
 """Windows 微信 4.x 的直接 UI Automation 发送实现。
 
-本模块只读取系统已公开的 UIA 树。它不会实例化第三方库中会写入
-Weixin.dll 的 accessibility gate，也不使用 OCR、固定坐标或物理鼠标兜底。
+本模块默认只读取系统已公开的 UIA 树。用户显式开启后，可对已绑定的
+Weixin.exe 执行一次经过严格校验的 accessibility gate 单字节热激活。
+它不使用 OCR、固定坐标或物理鼠标兜底。
 """
 
 from __future__ import annotations
@@ -36,6 +37,11 @@ SEND_NAMES = {"发送", "发送(S)", "Send"}
 
 _UIA_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wx-uia")
 
+PROCESS_VM_OPERATION = 0x0008
+PROCESS_VM_READ = 0x0010
+PROCESS_VM_WRITE = 0x0020
+PROCESS_QUERY_INFORMATION = 0x0400
+
 
 class UIAWindowError(RuntimeError):
     """带可诊断原因码的微信窗口/UIA 锚定错误。"""
@@ -43,6 +49,136 @@ class UIAWindowError(RuntimeError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
+
+
+class AccessibilityHotActivator:
+    """严格限制为一个已验证 Qt accessibility gate 字节的热激活器。"""
+
+    def __init__(self, driver_cls: Any = None, kernel32: Any = None) -> None:
+        self._driver_cls = driver_cls
+        self._kernel32 = kernel32
+
+    @staticmethod
+    def _result(
+        ok: bool,
+        status: str,
+        reason: str,
+        *,
+        wrote_memory: bool = False,
+        dll_version: str = "",
+    ) -> dict[str, Any]:
+        return {
+            "ok": ok,
+            "attempted": True,
+            "status": status,
+            "reason": reason,
+            "wrote_memory": wrote_memory,
+            "dll_version": dll_version,
+        }
+
+    def activate(self, hwnd: int, expected_pid: int) -> dict[str, Any]:
+        """解析、验证并将 gate 从 0 写为 1；任何异常值都拒绝写入。"""
+        try:
+            import win32process
+
+            _thread_id, actual_pid = win32process.GetWindowThreadProcessId(hwnd)
+        except Exception as exc:
+            return self._result(False, "failed", f"无法核对微信窗口 PID: {exc}")
+        if int(actual_pid or 0) != int(expected_pid):
+            return self._result(False, "failed", "微信窗口 PID 与已绑定账号不一致")
+
+        try:
+            driver_cls = self._driver_cls
+            if driver_cls is None:
+                from wechatauto.uia_driver import WeChatUIA
+
+                driver_cls = WeChatUIA
+            module = driver_cls._weixin_dll_module(int(expected_pid))
+            if not module:
+                return self._result(False, "failed", "已绑定进程未加载 Weixin.dll")
+            base, module_size, dll_path = module
+            if os.path.basename(str(dll_path)).casefold() != "weixin.dll":
+                return self._result(False, "failed", "模块路径不是 Weixin.dll")
+            dll_version = os.path.basename(os.path.dirname(str(dll_path)))
+            rva = driver_cls._qaccessible_active_rva(str(dll_path))
+            if rva is None:
+                return self._result(
+                    False,
+                    "unsupported_version",
+                    "当前 Weixin.dll 未匹配到唯一的 UIA gate 特征",
+                    dll_version=dll_version,
+                )
+            rva = int(rva)
+            if rva < 0 or rva >= int(module_size):
+                return self._result(
+                    False,
+                    "failed",
+                    "UIA gate 地址超出 Weixin.dll 模块范围",
+                    dll_version=dll_version,
+                )
+
+            kernel32 = self._kernel32 or ctypes.windll.kernel32
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            access = (
+                PROCESS_QUERY_INFORMATION
+                | PROCESS_VM_READ
+                | PROCESS_VM_WRITE
+                | PROCESS_VM_OPERATION
+            )
+            handle = kernel32.OpenProcess(access, False, int(expected_pid))
+            if not handle:
+                return self._result(
+                    False,
+                    "permission_denied",
+                    "无法以受限内存权限打开 Weixin.exe",
+                    dll_version=dll_version,
+                )
+            try:
+                address = int(base) + rva
+                current = driver_cls._read_process_byte(handle, address)
+                if current == 1:
+                    return self._result(
+                        True,
+                        "already_active",
+                        "微信 UIA gate 已处于激活状态",
+                        dll_version=dll_version,
+                    )
+                if current != 0:
+                    return self._result(
+                        False,
+                        "unexpected_value",
+                        f"UIA gate 原值异常（{current!r}），已拒绝写入",
+                        dll_version=dll_version,
+                    )
+                if not driver_cls._write_process_byte(handle, address, 1):
+                    return self._result(
+                        False,
+                        "write_failed",
+                        "写入 UIA gate 失败",
+                        dll_version=dll_version,
+                    )
+                if driver_cls._read_process_byte(handle, address) != 1:
+                    return self._result(
+                        False,
+                        "verify_failed",
+                        "UIA gate 写入后回读校验失败",
+                        wrote_memory=True,
+                        dll_version=dll_version,
+                    )
+                return self._result(
+                    True,
+                    "activated",
+                    "已完成 UIA gate 单字节热激活",
+                    wrote_memory=True,
+                    dll_version=dll_version,
+                )
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception as exc:
+            return self._result(False, "failed", f"UIA 热激活失败: {exc}")
 
 
 def _safe_attr(control: Any, name: str, default: Any = "") -> Any:
@@ -69,9 +205,14 @@ def _is_supported_main_class(class_name: str) -> bool:
 
 
 class DirectUIAAdapter:
-    """Direct uiautomation adapter with no accessibility hot activation."""
+    """直接 UIA 适配器；热激活只能由上层显式调用。"""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        hot_activator_factory: Callable[[], AccessibilityHotActivator] = (
+            AccessibilityHotActivator
+        ),
+    ) -> None:
         try:
             import uiautomation as auto
         except ImportError as exc:
@@ -79,6 +220,7 @@ class DirectUIAAdapter:
                 "UIA 依赖未安装，请重新安装 backend/requirements.txt"
             ) from exc
         self.auto = auto
+        self._hot_activator = hot_activator_factory()
 
     def main_window(self, pid: int, *, activate: bool = False) -> Any:
         """通过已绑定 PID 的 Win32 句柄锚定 UIA，不扫描 UIA Root。"""
@@ -153,6 +295,19 @@ class DirectUIAAdapter:
         if activate:
             self.activate(window, pid)
         return window
+
+    def hot_activate_accessibility(self, window: Any, pid: int) -> dict[str, Any]:
+        """对已通过 main_window 四重校验的微信窗口执行显式热激活。"""
+        hwnd = int(_safe_attr(window, "NativeWindowHandle", 0) or 0)
+        process_id = int(_safe_attr(window, "ProcessId", 0) or 0)
+        class_name = str(_safe_attr(window, "ClassName", "") or "")
+        if not hwnd or process_id != int(pid) or not _is_supported_main_class(class_name):
+            return AccessibilityHotActivator._result(
+                False,
+                "failed",
+                "微信 UIA 窗口身份复核失败，已拒绝热激活",
+            )
+        return self._hot_activator.activate(hwnd, int(pid))
 
     @staticmethod
     def activate(window: Any, pid: int) -> None:
@@ -462,6 +617,7 @@ class WindowsUIASender:
         self._adapter: Any = None
         self._binding_provider = binding_provider
         self._last_result: SendResult | None = None
+        self._last_hot_activation: dict[str, Any] = {}
         self.refresh_policy()
 
     def refresh_policy(self) -> None:
@@ -470,6 +626,9 @@ class WindowsUIASender:
         self._send_mode = mode if mode in {"auto", "background", "foreground"} else "auto"
         self._background_post_message = bool(cfg.get("background_post_message", True))
         self._allow_foreground_activation = bool(cfg.get("allow_foreground_activation", True))
+        self._hot_activate_accessibility = bool(
+            cfg.get("hot_activate_accessibility", False)
+        )
 
     def _binding(self) -> dict[str, Any]:
         if self._binding_provider is not None:
@@ -525,16 +684,127 @@ class WindowsUIASender:
                 pythoncom.CoUninitialize()
 
     async def prewarm(self) -> dict[str, Any]:
+        if self._hot_activate_accessibility:
+            await self.activate_accessibility()
         return await self.diagnose()
 
     async def diagnose(self) -> dict[str, Any]:
         return await self._run(self._diagnose_sync)
+
+    async def activate_accessibility(self) -> dict[str, Any]:
+        """显式执行已授权的单字节 UIA 热激活。"""
+        return await self._run(self._activate_accessibility_sync)
+
+    @staticmethod
+    def _core_controls_ready(adapter: Any, window: Any) -> bool:
+        try:
+            adapter.search_box(window)
+            adapter.session_list(window)
+            return True
+        except Exception:
+            return False
+
+    def _hot_activation_fields(self) -> dict[str, Any]:
+        last = self._last_hot_activation
+        return {
+            "hot_activation_enabled": self._hot_activate_accessibility,
+            "hot_activation_attempted": bool(last.get("attempted", False)),
+            "hot_activation_status": str(last.get("status", "not_attempted")),
+            "hot_activation_wrote_memory": bool(last.get("wrote_memory", False)),
+            "hot_activation_reason": str(last.get("reason", "") or ""),
+            "hot_activation_dll_version": str(last.get("dll_version", "") or ""),
+        }
+
+    def _activate_accessibility_sync(self) -> dict[str, Any]:
+        if not self._hot_activate_accessibility:
+            result = {
+                "ok": False,
+                "attempted": False,
+                "status": "disabled",
+                "reason": "单字节 UIA 热激活未开启",
+                "wrote_memory": False,
+                "dll_version": "",
+            }
+            self._last_hot_activation = result
+            return result
+
+        binding = self._binding()
+        valid, reason = self._validate_binding(binding)
+        if not valid:
+            result = AccessibilityHotActivator._result(False, "failed", reason)
+            self._last_hot_activation = result
+            return result
+
+        try:
+            adapter = self._get_adapter()
+            pid = int(binding["bound_pid"])
+            window = adapter.main_window(pid, activate=False)
+            if self._core_controls_ready(adapter, window):
+                result = {
+                    "ok": True,
+                    "attempted": False,
+                    "status": "already_ready",
+                    "reason": "微信 UIA 关键控件已经可用，无需写入内存",
+                    "wrote_memory": False,
+                    "dll_version": "",
+                }
+                self._last_hot_activation = result
+                return result
+
+            class_name = str(_safe_attr(window, "ClassName", "") or "")
+            if not NATIVE_MAIN_CLASS_RE.fullmatch(class_name):
+                result = AccessibilityHotActivator._result(
+                    False,
+                    "failed",
+                    f"当前 UIA 类名不允许热激活（{class_name or '-'}）",
+                )
+                self._last_hot_activation = result
+                return result
+
+            result = adapter.hot_activate_accessibility(window, pid)
+            self._last_hot_activation = result
+            if not result.get("ok"):
+                logger.warning("微信 UIA 热激活未完成: %s", result.get("reason"))
+                return result
+
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                time.sleep(0.1)
+                refreshed = adapter.main_window(pid, activate=False)
+                if self._core_controls_ready(adapter, refreshed):
+                    logger.warning(
+                        "微信 UIA 单字节热激活已生效: pid=%s status=%s wrote_memory=%s",
+                        pid,
+                        result.get("status"),
+                        result.get("wrote_memory"),
+                    )
+                    return result
+
+            result = {
+                **result,
+                "ok": False,
+                "status": "activated_tree_missing",
+                "reason": "UIA gate 已激活，但关键控件树仍未出现",
+            }
+            self._last_hot_activation = result
+            return result
+        except UIAWindowError as exc:
+            result = AccessibilityHotActivator._result(False, exc.code, str(exc))
+        except Exception as exc:
+            result = AccessibilityHotActivator._result(
+                False,
+                "failed",
+                f"UIA 热激活失败: {exc}",
+            )
+        self._last_hot_activation = result
+        return result
 
     def _diagnose_sync(self) -> dict[str, Any]:
         binding = self._binding()
         valid, reason = self._validate_binding(binding)
         result: dict[str, Any] = {
             **binding,
+            **self._hot_activation_fields(),
             "available": False,
             "main_window": False,
             "search_box": False,
@@ -606,6 +876,17 @@ class WindowsUIASender:
                         "已安全连接微信原生窗口；若重新检测后仍缺少控件，"
                         "说明当前微信没有向系统公开完整 UIA 树，程序会保持静默。"
                     )
+                if (
+                    self._hot_activate_accessibility
+                    and result["hot_activation_attempted"]
+                    and result["hot_activation_status"]
+                    not in {"activated", "already_active", "already_ready"}
+                ):
+                    result["reason"] = (
+                        "微信 UIA 热激活不可用："
+                        + (result["hot_activation_reason"] or "未知原因")
+                    )
+                    result["help"] = "已停止自动发送；不会改用 OCR、坐标或重复发送。"
         except UIAWindowError as exc:
             result["reason"] = str(exc)
             result["reason_code"] = exc.code
@@ -679,6 +960,14 @@ class WindowsUIASender:
             return result.fail("window", "foreground_disabled", "前台 UIA 回退已关闭")
 
         try:
+            if self._hot_activate_accessibility:
+                activation = self._activate_accessibility_sync()
+                if not activation.get("ok"):
+                    return result.fail(
+                        "window",
+                        "uia_hot_activation_failed",
+                        str(activation.get("reason", "UIA 热激活失败")),
+                    )
             adapter = self._get_adapter()
             background = mode == "background"
             state = adapter.input_state() if background else None
@@ -748,6 +1037,10 @@ class WindowsUIASender:
         if not valid:
             return False
         adapter = self._get_adapter()
+        if self._hot_activate_accessibility:
+            activation = self._activate_accessibility_sync()
+            if not activation.get("ok"):
+                return False
         modes = [self._send_mode]
         if self._send_mode == "auto":
             modes = ["background", "foreground"]

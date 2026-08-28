@@ -131,7 +131,7 @@ class AutoReplyPipeline:
         if platform.is_windows and hasattr(self._sender, "prewarm_uia"):
             diagnosis = await self._sender.prewarm_uia()
             if diagnosis.get("available"):
-                logger.info("Windows UIA 已只读预热完成")
+                logger.info("Windows UIA 已预热完成")
             else:
                 logger.warning(
                     "Windows UIA 尚不可用，自动发送将保持静默: %s",

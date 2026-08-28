@@ -178,7 +178,7 @@ class WindowsSender(BaseMessageSender):
         return await loop.run_in_executor(_executor, self._open_chat_sync, receiver)
 
     async def prewarm_uia(self) -> dict:
-        """只读预热 UIA 树，不激活、不点击微信。"""
+        """预热 UIA；仅在显式授权配置开启时执行单字节热激活。"""
         if self._send_method == "legacy_coordinates":
             return {
                 "available": False,
@@ -187,8 +187,18 @@ class WindowsSender(BaseMessageSender):
         return await self._get_uia_sender().prewarm()
 
     async def diagnose_uia(self) -> dict:
-        """返回账号/PID 绑定与关键 UIA 控件状态。"""
+        """只读返回账号/PID 绑定与关键 UIA 控件状态。"""
         return await self._get_uia_sender().diagnose()
+
+    async def activate_uia(self) -> dict:
+        """执行配置中已明确授权的 UIA 单字节热激活。"""
+        if self._send_method == "legacy_coordinates":
+            return {
+                "ok": False,
+                "status": "legacy_coordinates",
+                "reason": "当前显式启用了旧坐标发送模式",
+            }
+        return await self._get_uia_sender().activate_accessibility()
 
     def refresh_policy(self) -> None:
         """热更新 UIA 发送策略；发送次数限制始终硬编码为一次。"""

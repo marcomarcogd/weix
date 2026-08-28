@@ -97,6 +97,7 @@ export const getPlatformStatus = () => api.get('/platform/status')
 export const getWeChatAccounts = () => api.get('/platform/accounts')
 export const selectWeChatAccount = (wxid: string) => api.put('/platform/account', { wxid })
 export const diagnoseWeChatUIA = () => api.get('/platform/uia/diagnose')
+export const activateWeChatUIA = () => api.post('/platform/uia/activate')
 
 // Health
 export const getHealth = () => api.get('/health')

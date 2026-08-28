@@ -75,7 +75,7 @@
         </el-form-item>
         <el-divider content-position="left">Windows 微信 UIA 发送</el-divider>
         <el-alert
-          title="自动发送仅使用 UIA 控件定位，不会回退到固定坐标、OCR 或鼠标点击。重名、账号不明或控件不唯一时会保持静默。"
+          title="自动发送仅使用 UIA 控件定位，不会回退到固定坐标、OCR 或鼠标点击。单字节热激活默认关闭，只有显式开启后才会写入微信进程内存。"
           type="warning"
           :closable="false"
           show-icon
@@ -118,9 +118,28 @@
           <el-switch v-model="form.windows_sender.allow_foreground_activation" />
           <span class="inline-hint">只在任何发送动作发生前允许</span>
         </el-form-item>
+        <el-form-item label="单字节热激活">
+          <el-switch v-model="form.windows_sender.hot_activate_accessibility" />
+          <span class="inline-hint">对已绑定 Weixin.dll 的 UIA gate 写入一次 0 → 1</span>
+        </el-form-item>
+        <el-alert
+          v-if="form.windows_sender.hot_activate_accessibility"
+          title="此功能会修改微信进程运行时内存，无法承诺零封号风险。地址、原值或回读校验不通过时会立即停止。"
+          type="error"
+          :closable="false"
+          show-icon
+          style="margin-bottom: 18px"
+        />
         <el-form-item label="UIA 状态">
           <div style="width: 100%">
             <el-button :loading="diagnosing" @click="diagnoseUIA">检测微信 UIA</el-button>
+            <el-button
+              v-if="loadedHotActivation"
+              type="danger"
+              plain
+              :loading="activating"
+              @click="activateUIA"
+            >执行单字节热激活</el-button>
             <el-tag v-if="uiaStatus" :type="uiaStatus.available ? 'success' : 'danger'" style="margin-left: 10px">
               {{ uiaStatus.available ? '已就绪' : '不可用' }}
             </el-tag>
@@ -130,6 +149,7 @@
               <el-descriptions-item label="会话列表">{{ stateText(uiaStatus.session_list) }}</el-descriptions-item>
               <el-descriptions-item label="输入框">{{ stateText(uiaStatus.chat_input) }}</el-descriptions-item>
               <el-descriptions-item label="发送按钮">{{ stateText(uiaStatus.send_button) }}</el-descriptions-item>
+              <el-descriptions-item label="热激活">{{ hotActivationText(uiaStatus) }}</el-descriptions-item>
               <el-descriptions-item label="原因">{{ uiaStatus.reason || '-' }}</el-descriptions-item>
             </el-descriptions>
             <el-alert
@@ -161,8 +181,9 @@ import {
   getWeChatAccounts,
   selectWeChatAccount,
   diagnoseWeChatUIA,
+  activateWeChatUIA,
 } from '../api'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
 const form = reactive<any>({
   enabled: false,
@@ -176,6 +197,7 @@ const form = reactive<any>({
     send_mode: 'auto',
     background_post_message: true,
     allow_foreground_activation: true,
+    hot_activate_accessibility: false,
   },
 })
 
@@ -195,10 +217,30 @@ const accountsLoading = ref(false)
 const selectedAccount = ref('')
 const accountStatus = reactive<any>({ active: '', bound_pid: null })
 const diagnosing = ref(false)
+const activating = ref(false)
 const uiaStatus = ref<any>(null)
+const loadedHotActivation = ref(false)
 
 function stateText(value: boolean) {
   return value ? '已找到' : '未找到'
+}
+
+function hotActivationText(status: any) {
+  if (!status?.hot_activation_enabled) return '未开启'
+  const labels: Record<string, string> = {
+    not_attempted: '已开启，尚未执行',
+    already_ready: '控件已就绪，无需写入',
+    activated: '已写入并生效',
+    already_active: '此前已激活',
+    activated_tree_missing: '已写入但控件树未出现',
+    unsupported_version: '当前版本不支持',
+    permission_denied: '权限不足',
+    unexpected_value: '原值异常，已拒绝',
+    write_failed: '写入失败',
+    verify_failed: '回读失败',
+    failed: '执行失败',
+  }
+  return labels[status.hot_activation_status] || status.hot_activation_status || '未知'
 }
 
 async function loadAccounts() {
@@ -235,6 +277,30 @@ async function diagnoseUIA() {
     }
   } finally {
     diagnosing.value = false
+  }
+}
+
+async function activateUIA() {
+  try {
+    await ElMessageBox.confirm(
+      '此操作会向当前已绑定的 Weixin.dll 运行时写入一个 UIA gate 字节。继续吗？',
+      '确认单字节 UIA 热激活',
+      { confirmButtonText: '确认执行', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch {
+    return
+  }
+  activating.value = true
+  try {
+    const res = await activateWeChatUIA()
+    if (res.data?.ok) {
+      ElMessage.success(res.data?.reason || 'UIA 热激活已完成')
+    } else {
+      ElMessage.warning(res.data?.reason || 'UIA 热激活未完成')
+    }
+    await diagnoseUIA()
+  } finally {
+    activating.value = false
   }
 }
 
@@ -329,7 +395,12 @@ function removeUser(user: string) {
 onMounted(async () => {
   try {
     const res = await getChatConfig()
-    if (res.data) Object.assign(form, res.data)
+    if (res.data) {
+      Object.assign(form, res.data)
+      loadedHotActivation.value = Boolean(
+        res.data?.windows_sender?.hot_activate_accessibility,
+      )
+    }
   } catch {
     ElMessage.error('加载配置失败')
   }
@@ -357,9 +428,24 @@ onMounted(async () => {
 })
 
 async function saveConfig() {
+  if (form.windows_sender.hot_activate_accessibility && !loadedHotActivation.value) {
+    try {
+      await ElMessageBox.confirm(
+        '开启后，服务启动或手动执行时可能修改 Weixin.dll 的一个运行时字节，且无法承诺零封号风险。确认保存吗？',
+        '确认开启单字节热激活',
+        { confirmButtonText: '确认开启', cancelButtonText: '取消', type: 'warning' },
+      )
+    } catch {
+      return
+    }
+  }
   saving.value = true
   try {
     await updateChatConfig(form)
+    loadedHotActivation.value = Boolean(
+      form.windows_sender.hot_activate_accessibility,
+    )
+    uiaStatus.value = null
     ElMessage.success('配置已保存')
   } finally {
     saving.value = false

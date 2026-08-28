@@ -60,6 +60,8 @@ windows_sender:
   send_mode: auto
   background_post_message: true
   allow_foreground_activation: true
+  # 高风险可选项：写入 Weixin.dll 运行时的一个 UIA gate 字节，默认关闭。
+  hot_activate_accessibility: false
   click_x_ratio: 0.5
   click_y_ratio: 0.88
   park_after_send: true
