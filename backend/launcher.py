@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -16,6 +17,7 @@ import threading
 import time
 import urllib.request
 import webbrowser
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
@@ -88,6 +90,8 @@ STARTUP_TIMEOUT_SECONDS = 150.0
 GRACEFUL_STOP_TIMEOUT_SECONDS = 20.0
 LOG_MAX_BYTES = 10 * 1024 * 1024
 LOG_BACKUP_COUNT = 5
+SERVICE_STATE_VERSION = 1
+SERVICE_STATE_FILENAME = ".weix_services.json"
 ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -98,9 +102,21 @@ class ServiceState(Enum):
     STOPPED = auto()
     STARTING = auto()
     RUNNING = auto()
+    PARTIAL = auto()
     STOPPING = auto()
     RESTARTING = auto()
     ERROR = auto()
+
+
+@dataclass
+class ServiceProcessRef:
+    """可跨管理器实例校验的本项目服务进程引用。"""
+
+    kind: str
+    pid: int
+    create_time: float
+    popen: Optional[subprocess.Popen[str]] = None
+    adopted: bool = False
 
 
 class LauncherSignals(QObject):
@@ -509,7 +525,7 @@ def url_is_ready(url: str, timeout: float = 0.6) -> bool:
 
 
 class ServiceController:
-    """只管理当前管理器启动的两个子进程。"""
+    """管理并安全接管可确认为当前项目的前后端进程。"""
 
     SOURCE_LABELS = {
         "manager": "管理器",
@@ -523,12 +539,13 @@ class ServiceController:
         self.logs_dir = project_root / "logs"
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.stop_file = self.logs_dir / ".weix_backend.stop"
+        self.service_state_file = self.logs_dir / SERVICE_STATE_FILENAME
         self._sinks = {
             source: RotatingLogSink(self.logs_dir / f"{source}.log")
             for source in self.SOURCE_LABELS
         }
-        self._backend_process: Optional[subprocess.Popen[str]] = None
-        self._frontend_process: Optional[subprocess.Popen[str]] = None
+        self._backend_process: Optional[ServiceProcessRef] = None
+        self._frontend_process: Optional[ServiceProcessRef] = None
         self._operation_lock = threading.RLock()
         self._process_lock = threading.RLock()
 
@@ -544,23 +561,338 @@ class ServiceController:
         for sink in self._sinks.values():
             sink.clear()
 
-    def start(self) -> tuple[bool, str]:
-        with self._operation_lock:
-            if self.any_process_running():
-                return False, "管理器已启动服务，不能重复启动"
+    @staticmethod
+    def _normalized_path(value: str | Path) -> str:
+        raw = str(value).strip().strip('"')
+        try:
+            resolved = Path(raw).resolve(strict=False)
+        except (OSError, RuntimeError):
+            resolved = Path(os.path.abspath(raw))
+        return os.path.normcase(os.path.normpath(str(resolved)))
 
-            conflicts = []
-            for name, port in (("后端", BACKEND_PORT), ("前端", FRONTEND_PORT)):
-                if port_is_listening(port):
+    def _service_definition(self, kind: str) -> tuple[Path, Path, int]:
+        if kind == "backend":
+            return (
+                self.project_root / "backend" / "managed_server.py",
+                self.project_root / "backend",
+                BACKEND_PORT,
+            )
+        if kind == "frontend":
+            return (
+                self.project_root
+                / "frontend"
+                / "node_modules"
+                / "vite"
+                / "bin"
+                / "vite.js",
+                self.project_root / "frontend",
+                FRONTEND_PORT,
+            )
+        raise ValueError(f"未知服务类型：{kind}")
+
+    @staticmethod
+    def _option_matches(arguments: list[str], option: str, value: str) -> bool:
+        try:
+            index = arguments.index(option)
+        except ValueError:
+            return False
+        return index + 1 < len(arguments) and arguments[index + 1] == value
+
+    def _path_option_matches(
+        self,
+        arguments: list[str],
+        option: str,
+        value: Path,
+    ) -> bool:
+        try:
+            index = arguments.index(option)
+        except ValueError:
+            return False
+        return index + 1 < len(arguments) and (
+            self._normalized_path(arguments[index + 1])
+            == self._normalized_path(value)
+        )
+
+    def _process_matches_service(self, process: psutil.Process, kind: str) -> bool:
+        """按精确脚本、工作目录和端口匹配，无法读取时拒绝接管。"""
+        target, expected_cwd, port = self._service_definition(kind)
+        try:
+            name = process.name().lower()
+            arguments = [str(value) for value in process.cmdline()]
+            cwd = process.cwd()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return False
+
+        expected_names = {"python", "python.exe"} if kind == "backend" else {
+            "node",
+            "node.exe",
+        }
+        if name not in expected_names:
+            return False
+        normalized_arguments = {
+            self._normalized_path(value)
+            for value in arguments
+            if value and not value.startswith("-")
+        }
+        if self._normalized_path(target) not in normalized_arguments:
+            return False
+        if self._normalized_path(cwd) != self._normalized_path(expected_cwd):
+            return False
+        if not self._option_matches(arguments, "--port", str(port)):
+            return False
+        if kind == "backend":
+            if not self._path_option_matches(
+                arguments,
+                "--stop-file",
+                self.stop_file,
+            ):
+                return False
+        elif "--strictPort" not in arguments:
+            return False
+        return True
+
+    @staticmethod
+    def _process_identity_matches(
+        process: psutil.Process,
+        reference: ServiceProcessRef,
+    ) -> bool:
+        try:
+            return (
+                process.pid == reference.pid
+                and abs(process.create_time() - reference.create_time) < 1.0
+                and process.is_running()
+                and process.status() != psutil.STATUS_ZOMBIE
+            )
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return False
+
+    def _validated_process(
+        self,
+        reference: Optional[ServiceProcessRef],
+    ) -> Optional[psutil.Process]:
+        if reference is None:
+            return None
+        try:
+            process = psutil.Process(reference.pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return None
+        if not self._process_identity_matches(process, reference):
+            return None
+        if not self._process_matches_service(process, reference.kind):
+            return None
+        return process
+
+    @staticmethod
+    def _is_descendant_or_same(root_pid: int, candidate_pid: int) -> bool:
+        if root_pid == candidate_pid:
+            return True
+        try:
+            process = psutil.Process(candidate_pid)
+            return any(parent.pid == root_pid for parent in process.parents())
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return False
+
+    def _reference_controls_listener(self, reference: ServiceProcessRef) -> bool:
+        _target, _cwd, port = self._service_definition(reference.kind)
+        listener_pid = listening_pid(port)
+        return listener_pid is not None and self._is_descendant_or_same(
+            reference.pid,
+            listener_pid,
+        )
+
+    def _reference_from_process(
+        self,
+        process: psutil.Process,
+        kind: str,
+        *,
+        adopted: bool,
+        popen: Optional[subprocess.Popen[str]] = None,
+    ) -> Optional[ServiceProcessRef]:
+        try:
+            reference = ServiceProcessRef(
+                kind=kind,
+                pid=process.pid,
+                create_time=process.create_time(),
+                popen=popen,
+                adopted=adopted,
+            )
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return None
+        if not self._process_matches_service(process, kind):
+            return None
+        return reference
+
+    def _reference_from_popen(
+        self,
+        process: subprocess.Popen[str],
+        kind: str,
+    ) -> ServiceProcessRef:
+        reference = self._reference_from_process(
+            psutil.Process(process.pid),
+            kind,
+            adopted=False,
+            popen=process,
+        )
+        if reference is None:
+            try:
+                process.kill()
+                process.wait(timeout=3)
+            except Exception:
+                pass
+            raise RuntimeError(f"无法登记{self.SOURCE_LABELS[kind]}进程身份")
+        return reference
+
+    def _discover_reference_from_listener(
+        self,
+        kind: str,
+    ) -> Optional[ServiceProcessRef]:
+        _target, _cwd, port = self._service_definition(kind)
+        listener_pid = listening_pid(port)
+        if listener_pid is None:
+            return None
+        try:
+            listener = psutil.Process(listener_pid)
+            candidates = [listener] + listener.parents()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return None
+
+        # 选择最高层仍带有相同启动签名的进程，停止时才能覆盖其整个子树。
+        reference = None
+        for candidate in candidates:
+            matched = self._reference_from_process(
+                candidate,
+                kind,
+                adopted=True,
+            )
+            if matched is not None:
+                reference = matched
+        return reference
+
+    def _load_saved_state(self) -> dict[str, Any]:
+        try:
+            raw = json.loads(self.service_state_file.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            return {}
+        if not isinstance(raw, dict) or raw.get("version") != SERVICE_STATE_VERSION:
+            return {}
+        saved_root = raw.get("project_root")
+        if not isinstance(saved_root, str) or (
+            self._normalized_path(saved_root)
+            != self._normalized_path(self.project_root)
+        ):
+            return {}
+        return raw
+
+    def _reference_from_saved_state(
+        self,
+        saved: dict[str, Any],
+        kind: str,
+    ) -> Optional[ServiceProcessRef]:
+        entry = saved.get(kind)
+        if not isinstance(entry, dict):
+            return None
+        try:
+            reference = ServiceProcessRef(
+                kind=kind,
+                pid=int(entry["pid"]),
+                create_time=float(entry["create_time"]),
+                adopted=True,
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        process = self._validated_process(reference)
+        if process is None or not self._reference_controls_listener(reference):
+            return None
+        return reference
+
+    def _persist_service_state(self) -> None:
+        backend, frontend = self._process_snapshot()
+        entries: dict[str, Any] = {}
+        for kind, reference in (("backend", backend), ("frontend", frontend)):
+            if not self._is_running(reference):
+                continue
+            entries[kind] = {
+                "pid": reference.pid,
+                "create_time": reference.create_time,
+            }
+        if not entries:
+            try:
+                self.service_state_file.unlink()
+            except FileNotFoundError:
+                pass
+            return
+
+        payload = {
+            "version": SERVICE_STATE_VERSION,
+            "project_root": str(self.project_root.resolve()),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            **entries,
+        }
+        temporary = self.service_state_file.with_name(
+            f"{self.service_state_file.name}.tmp"
+        )
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, self.service_state_file)
+
+    def adopt_existing_services(
+        self,
+    ) -> tuple[tuple[bool, bool], list[str], list[str]]:
+        """识别当前项目遗留服务；返回状态、已接管项和未知端口冲突。"""
+        with self._operation_lock:
+            saved = self._load_saved_state()
+            adopted_names: list[str] = []
+            conflicts: list[str] = []
+            with self._process_lock:
+                current = {
+                    "backend": self._backend_process,
+                    "frontend": self._frontend_process,
+                }
+
+            for kind, label, port in (
+                ("backend", "后端", BACKEND_PORT),
+                ("frontend", "前端", FRONTEND_PORT),
+            ):
+                reference = current[kind]
+                if not self._is_running(reference):
+                    reference = self._reference_from_saved_state(saved, kind)
+                    if reference is None and port_is_listening(port):
+                        reference = self._discover_reference_from_listener(kind)
+                    if reference is not None:
+                        with self._process_lock:
+                            if kind == "backend":
+                                self._backend_process = reference
+                            else:
+                                self._frontend_process = reference
+                        adopted_names.append(f"{label}（PID {reference.pid}）")
+                if port_is_listening(port) and reference is None:
                     pid = listening_pid(port)
                     conflicts.append(
-                        f"{name}端口 {port} 已被占用"
+                        f"{label}端口 {port}"
                         + (f"（PID {pid}）" if pid else "")
                     )
+
+            self._persist_service_state()
+            return self.process_status(), adopted_names, conflicts
+
+    def start(self) -> tuple[bool, str]:
+        with self._operation_lock:
+            (backend_running, frontend_running), adopted, conflicts = (
+                self.adopt_existing_services()
+            )
+            if backend_running or frontend_running:
+                details = "、".join(adopted) if adopted else "当前项目服务"
+                return (
+                    False,
+                    f"已识别到{details}正在运行，请使用“停止”或“重启”操作。",
+                )
+
             if conflicts:
                 return (
                     False,
-                    "；".join(conflicts)
+                    "；".join(f"{item} 已被未知程序占用" for item in conflicts)
                     + "。为避免误关其他程序，管理器没有结束它。",
                 )
 
@@ -624,7 +956,11 @@ class ServiceController:
                     creationflags=flags,
                 )
                 with self._process_lock:
-                    self._backend_process = backend
+                    self._backend_process = self._reference_from_popen(
+                        backend,
+                        "backend",
+                    )
+                self._persist_service_state()
                 self._start_output_pump("backend", backend)
 
                 self.log("manager", "正在隐藏启动前端服务...")
@@ -650,7 +986,11 @@ class ServiceController:
                     creationflags=flags,
                 )
                 with self._process_lock:
-                    self._frontend_process = frontend
+                    self._frontend_process = self._reference_from_popen(
+                        frontend,
+                        "frontend",
+                    )
+                self._persist_service_state()
                 self._start_output_pump("frontend", frontend)
 
                 deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
@@ -689,28 +1029,44 @@ class ServiceController:
                 return True, "服务已停止"
 
             if force:
-                self.log("manager", "正在强制结束本轮启动的进程...")
-                self._terminate_process_tree(frontend, force=True)
-                self._terminate_process_tree(backend, force=True)
+                self.log("manager", "正在强制结束已确认属于当前项目的进程...")
+                frontend_stopped = self._terminate_process_tree(frontend, force=True)
+                backend_stopped = self._terminate_process_tree(backend, force=True)
                 self._clear_process_references()
                 self._remove_stop_file()
+                if not frontend_stopped or not backend_stopped:
+                    return False, "部分进程无法结束，请确认管理器具有管理员权限"
                 return True, "服务已强制停止"
 
             self.log("manager", "正在通知后端正常停止...")
             if self._is_running(backend):
+                if self._validated_process(backend) is None:
+                    return False, "后端进程身份复核失败，管理器拒绝停止"
                 self.stop_file.parent.mkdir(parents=True, exist_ok=True)
                 self.stop_file.write_text("stop\n", encoding="utf-8")
 
+            frontend_stopped = True
             if self._is_running(frontend):
                 self.log("manager", "正在停止前端服务...")
-                self._terminate_process_tree(frontend, force=False)
+                frontend_stopped = self._terminate_process_tree(
+                    frontend,
+                    force=False,
+                )
 
-            if self._is_running(backend):
-                try:
-                    backend.wait(timeout=GRACEFUL_STOP_TIMEOUT_SECONDS)
-                except subprocess.TimeoutExpired:
-                    self.log("manager", "后端在 20 秒内未完成正常停止")
-                    return False, "后端未能在 20 秒内正常停止"
+            backend_stopped = (
+                True
+                if backend is None
+                else self._wait_for_service_stop(
+                    backend,
+                    BACKEND_PORT,
+                    GRACEFUL_STOP_TIMEOUT_SECONDS,
+                )
+            )
+            if not backend_stopped:
+                self.log("manager", "后端在 20 秒内未完成正常停止")
+                return False, "后端未能在 20 秒内正常停止"
+            if not frontend_stopped:
+                return False, "前端进程未能正常停止"
 
             self._clear_process_references()
             self._remove_stop_file()
@@ -723,17 +1079,26 @@ class ServiceController:
 
     def process_status(self) -> tuple[bool, bool]:
         backend, frontend = self._process_snapshot()
-        return self._is_running(backend), self._is_running(frontend)
+        backend_running = self._is_running(backend)
+        frontend_running = self._is_running(frontend)
+        if (backend is not None and not backend_running) or (
+            frontend is not None and not frontend_running
+        ):
+            self._clear_process_references()
+        return backend_running, frontend_running
 
     def _process_snapshot(
         self,
-    ) -> tuple[Optional[subprocess.Popen[str]], Optional[subprocess.Popen[str]]]:
+    ) -> tuple[Optional[ServiceProcessRef], Optional[ServiceProcessRef]]:
         with self._process_lock:
             return self._backend_process, self._frontend_process
 
-    @staticmethod
-    def _is_running(process: Optional[subprocess.Popen[str]]) -> bool:
-        return process is not None and process.poll() is None
+    def _is_running(self, reference: Optional[ServiceProcessRef]) -> bool:
+        if reference is None:
+            return False
+        if reference.popen is not None and reference.popen.poll() is not None:
+            return False
+        return self._validated_process(reference) is not None
 
     def _start_output_pump(self, source: str, process: subprocess.Popen[str]) -> None:
         def pump() -> None:
@@ -766,22 +1131,30 @@ class ServiceController:
         if self._is_running(backend):
             try:
                 self.stop_file.write_text("stop\n", encoding="utf-8")
-                backend.wait(timeout=5)
+                stopped = self._wait_for_service_stop(
+                    backend,
+                    BACKEND_PORT,
+                    5.0,
+                )
+                if not stopped:
+                    self._terminate_process_tree(backend, force=True)
             except Exception:
                 self._terminate_process_tree(backend, force=True)
         self._clear_process_references()
         self._remove_stop_file()
 
-    @staticmethod
     def _terminate_process_tree(
-        process: Optional[subprocess.Popen[str]],
+        self,
+        reference: Optional[ServiceProcessRef],
         force: bool,
-    ) -> None:
-        if process is None or process.poll() is not None:
-            return
+    ) -> bool:
+        if not self._is_running(reference):
+            return True
+        process = self._validated_process(reference)
+        if process is None:
+            return False
         try:
-            parent = psutil.Process(process.pid)
-            targets = parent.children(recursive=True) + [parent]
+            targets = process.children(recursive=True) + [process]
             for target in targets:
                 try:
                     target.kill() if force else target.terminate()
@@ -793,8 +1166,28 @@ class ServiceController:
                     target.kill()
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
+            if alive:
+                psutil.wait_procs(alive, timeout=2.0)
         except psutil.NoSuchProcess:
-            pass
+            return True
+        except (psutil.AccessDenied, OSError):
+            return not self._is_running(reference)
+        return not self._is_running(reference)
+
+    def _wait_for_service_stop(
+        self,
+        reference: Optional[ServiceProcessRef],
+        port: int,
+        timeout: float,
+    ) -> bool:
+        if reference is None:
+            return not port_is_listening(port)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self._is_running(reference) and not port_is_listening(port):
+                return True
+            time.sleep(0.2)
+        return not self._is_running(reference) and not port_is_listening(port)
 
     def _clear_process_references(self) -> None:
         with self._process_lock:
@@ -802,6 +1195,7 @@ class ServiceController:
                 self._backend_process = None
             if not self._is_running(self._frontend_process):
                 self._frontend_process = None
+        self._persist_service_state()
 
     def _remove_stop_file(self) -> None:
         try:
@@ -824,6 +1218,7 @@ class MainWindow(QMainWindow):
         self._controller = ServiceController(project_root, signals)
         self._state = ServiceState.STOPPED
         self._restart_pending = False
+        self._force_stop_in_progress = False
         self._quit_after_stop = False
         self._allow_close = False
         self._tray_notice_shown = False
@@ -835,7 +1230,7 @@ class MainWindow(QMainWindow):
 
         self._init_ui(project_root)
         self._init_tray()
-        self._set_state(ServiceState.STOPPED)
+        self._recognize_existing_services(initial=True)
 
         self._status_timer = QTimer(self)
         self._status_timer.timeout.connect(self._refresh_process_status)
@@ -870,6 +1265,7 @@ class MainWindow(QMainWindow):
         self._btn_start = QPushButton("启动")
         self._btn_stop = QPushButton("停止")
         self._btn_restart = QPushButton("重启")
+        self._btn_recognize = QPushButton("识别服务")
         self._btn_browser = QPushButton("打开网页")
         self._btn_calibrate = QPushButton("微信点击校准")
         self._btn_clear_view = QPushButton("清空显示")
@@ -877,6 +1273,7 @@ class MainWindow(QMainWindow):
         self._btn_start.clicked.connect(self._begin_start)
         self._btn_stop.clicked.connect(self._begin_stop)
         self._btn_restart.clicked.connect(self._begin_restart)
+        self._btn_recognize.clicked.connect(self._recognize_existing_services)
         self._btn_browser.clicked.connect(self._open_browser)
         self._btn_calibrate.clicked.connect(self._begin_calibration)
         self._btn_clear_view.clicked.connect(self._clear_log_view)
@@ -885,6 +1282,7 @@ class MainWindow(QMainWindow):
             self._btn_start,
             self._btn_stop,
             self._btn_restart,
+            self._btn_recognize,
             self._btn_browser,
             self._btn_calibrate,
             self._btn_clear_view,
@@ -944,11 +1342,19 @@ class MainWindow(QMainWindow):
 
     def _set_state(self, state: ServiceState, message: str = "") -> None:
         self._state = state
-        any_process_running = self._controller.any_process_running()
+        backend_running, frontend_running = self._controller.process_status()
+        any_process_running = backend_running or frontend_running
         mapping = {
             ServiceState.STOPPED: ("总体：已停止", True, False, False, False),
             ServiceState.STARTING: ("总体：启动中…", False, False, False, False),
             ServiceState.RUNNING: ("总体：运行中", False, True, True, True),
+            ServiceState.PARTIAL: (
+                "总体：部分运行",
+                False,
+                True,
+                True,
+                frontend_running,
+            ),
             ServiceState.STOPPING: ("总体：停止中…", False, False, False, False),
             ServiceState.RESTARTING: ("总体：重启中…", False, False, False, False),
             ServiceState.ERROR: (
@@ -966,6 +1372,9 @@ class MainWindow(QMainWindow):
         self._btn_start.setEnabled(start_enabled)
         self._btn_stop.setEnabled(stop_enabled)
         self._btn_restart.setEnabled(restart_enabled)
+        self._btn_recognize.setEnabled(
+            state in (ServiceState.STOPPED, ServiceState.PARTIAL, ServiceState.ERROR)
+        )
         self._btn_browser.setEnabled(browser_enabled)
         self._btn_calibrate.setEnabled(
             state == ServiceState.STOPPED and not any_process_running
@@ -976,6 +1385,46 @@ class MainWindow(QMainWindow):
         self._tray_open.setEnabled(browser_enabled)
         self._statusbar.showMessage(message or label)
         self._tray.setToolTip(f"{APP_TITLE} - {label.replace('总体：', '')}")
+
+    def _recognize_existing_services(self, initial: bool = False) -> None:
+        if self._state in (
+            ServiceState.STARTING,
+            ServiceState.STOPPING,
+            ServiceState.RESTARTING,
+        ):
+            return
+        (backend_running, frontend_running), adopted, conflicts = (
+            self._controller.adopt_existing_services()
+        )
+        if adopted:
+            details = "、".join(adopted)
+            self._controller.log("manager", f"已识别并接管遗留服务：{details}")
+        self._backend_label.setText(
+            f"后端：{'运行中' if backend_running else '已停止'}"
+        )
+        self._frontend_label.setText(
+            f"前端：{'运行中' if frontend_running else '已停止'}"
+        )
+
+        if conflicts:
+            message = (
+                "；".join(f"{item} 被未知程序占用" for item in conflicts)
+                + "。为避免误关其他程序，管理器不会接管。"
+            )
+            self._controller.log("manager", message)
+            self._set_state(ServiceState.ERROR, message)
+        elif backend_running and frontend_running:
+            message = "已接管当前项目正在运行的前后端服务"
+            self._set_state(ServiceState.RUNNING, message)
+        elif backend_running or frontend_running:
+            running_name = "后端" if backend_running else "前端"
+            message = f"已接管当前项目的{running_name}；可直接停止或重启"
+            self._set_state(ServiceState.PARTIAL, message)
+        else:
+            self._set_state(ServiceState.STOPPED, "未发现正在运行的本项目服务")
+
+        if not initial:
+            self._statusbar.showMessage(self._statusbar.currentMessage(), 5000)
 
     def _begin_start(self) -> None:
         if self._state not in (ServiceState.STOPPED, ServiceState.ERROR):
@@ -993,6 +1442,16 @@ class MainWindow(QMainWindow):
     def _on_start_finished(self, ok: bool, message: str) -> None:
         if ok:
             self._set_state(ServiceState.RUNNING, message)
+            return
+        backend_running, frontend_running = self._controller.process_status()
+        if backend_running or frontend_running:
+            target = (
+                ServiceState.RUNNING
+                if backend_running and frontend_running
+                else ServiceState.PARTIAL
+            )
+            self._set_state(target, message)
+            QMessageBox.information(self, "已识别现有服务", message)
             return
         self._restart_pending = False
         self._set_state(ServiceState.ERROR, message)
@@ -1017,7 +1476,7 @@ class MainWindow(QMainWindow):
         threading.Thread(target=worker, daemon=True, name="weix-stop-worker").start()
 
     def _begin_restart(self) -> None:
-        if self._state != ServiceState.RUNNING:
+        if self._state not in (ServiceState.RUNNING, ServiceState.PARTIAL):
             return
         self._restart_pending = True
         self._controller.log("manager", "收到重启请求")
@@ -1025,14 +1484,22 @@ class MainWindow(QMainWindow):
 
     def _on_stop_finished(self, ok: bool, message: str) -> None:
         if not ok:
+            if self._force_stop_in_progress:
+                self._force_stop_in_progress = False
+                self._restart_pending = False
+                self._quit_after_stop = False
+                self._set_state(ServiceState.ERROR, message)
+                QMessageBox.critical(self, "强制停止失败", message)
+                return
             force = QMessageBox.question(
                 self,
                 "正常停止超时",
-                f"{message}\n\n是否强制结束管理器本轮启动的进程？",
+                f"{message}\n\n是否强制结束已确认属于当前项目的进程？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
             if force == QMessageBox.StandardButton.Yes:
+                self._force_stop_in_progress = True
                 self._set_state(ServiceState.STOPPING, "正在强制停止服务...")
 
                 def worker() -> None:
@@ -1051,6 +1518,7 @@ class MainWindow(QMainWindow):
             return
 
         should_restart = self._restart_pending
+        self._force_stop_in_progress = False
         self._restart_pending = False
         self._set_state(ServiceState.STOPPED, message)
         if self._quit_after_stop:
@@ -1074,7 +1542,16 @@ class MainWindow(QMainWindow):
             self._unexpected_failure_handled = True
             missing = "后端" if not backend_running else "前端"
             self._controller.log("manager", f"检测到{missing}进程意外退出")
-            self._set_state(ServiceState.ERROR, f"{missing}进程意外退出")
+            self._set_state(
+                ServiceState.PARTIAL,
+                f"{missing}进程意外退出，可点击重启恢复",
+            )
+        elif self._state == ServiceState.PARTIAL:
+            if backend_running and frontend_running:
+                self._unexpected_failure_handled = False
+                self._set_state(ServiceState.RUNNING, "前后端均已恢复运行")
+            elif not backend_running and not frontend_running:
+                self._set_state(ServiceState.STOPPED, "服务已全部停止")
 
     def _append_log(self, source: str, text: str) -> None:
         label = ServiceController.SOURCE_LABELS.get(source, source)
