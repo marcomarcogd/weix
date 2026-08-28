@@ -44,7 +44,7 @@ class _WindowRef:
 
     def activate(self) -> None:
         if not self.hwnd:
-            return
+            raise RuntimeError("微信窗口缺少有效句柄")
         try:
             import win32con
             import win32gui
@@ -53,7 +53,6 @@ class _WindowRef:
                 win32gui.ShowWindow(self.hwnd, win32con.SW_RESTORE)
             else:
                 win32gui.ShowWindow(self.hwnd, win32con.SW_SHOW)
-            win32gui.SetForegroundWindow(self.hwnd)
 
             # 最小化窗口的旧坐标通常位于 (-32000, -32000)，恢复后必须
             # 重新读取真实尺寸，避免后续可见性修正使用旧坐标缩小或误点窗口。
@@ -63,9 +62,9 @@ class _WindowRef:
                 self.top = top
                 self.width = right - left
                 self.height = bottom - top
-        except Exception:
-            # The caller has a click-based fallback after activation.
-            pass
+            win32gui.SetForegroundWindow(self.hwnd)
+        except Exception as exc:
+            raise RuntimeError("微信窗口激活失败") from exc
 
 
 class WindowsSender(BaseMessageSender):
@@ -118,6 +117,7 @@ class WindowsSender(BaseMessageSender):
 
         self._last_receiver = ""
         self._last_send_time: float = 0.0
+        self._active_wechat_hwnd: int | None = None
 
     # --- 公共接口 ---
 
@@ -365,24 +365,158 @@ class WindowsSender(BaseMessageSender):
         return matches[0] if matches else None
 
     def _activate_wechat(self) -> None:
-        """激活微信窗口。"""
+        """激活微信窗口并确认前台归属；失败时禁止继续鼠标操作。"""
         win = self._find_wechat_window()
         if win is None:
             raise RuntimeError("未找到微信窗口")
 
-        try:
-            win.activate()
-        except Exception:
-            # pygetwindow.activate 某些版本不可靠，用点击任务栏兜底
-            pass
+        hwnd = self._window_hwnd(win)
+        if not hwnd:
+            raise RuntimeError("无法取得微信主窗口句柄，已中止本次 GUI 操作")
 
-        time.sleep(self._window_activate_delay)
-        win = self._ensure_window_visible(win)
+        self._active_wechat_hwnd = None
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                win.activate()
+            except Exception as exc:
+                last_error = exc
+                logger.debug("微信窗口常规激活失败（第 %d 次）: %s", attempt, exc)
+
+            win = self._ensure_window_visible(win)
+            if self._is_wechat_foreground(hwnd):
+                time.sleep(max(float(self._window_activate_delay), 0.0))
+                if self._is_wechat_foreground(hwnd):
+                    self._active_wechat_hwnd = hwnd
+                    return
+
+            try:
+                self._request_wechat_foreground(hwnd)
+            except Exception as exc:
+                last_error = exc
+                logger.debug("微信窗口前台请求失败（第 %d 次）: %s", attempt, exc)
+
+            time.sleep(max(float(self._window_activate_delay), 0.05))
+            if self._is_wechat_foreground(hwnd):
+                self._active_wechat_hwnd = hwnd
+                return
+
+        logger.error(
+            "微信窗口未能切换到前台，已中止本次 GUI 操作 | hwnd=%s | error=%s",
+            hwnd,
+            last_error or "foreground verification failed",
+        )
+        raise RuntimeError("微信窗口未成功切换到前台，已中止本次发送")
+
+    @staticmethod
+    def _window_hwnd(win) -> int | None:
+        """兼容 Win32 与 pygetwindow 窗口对象的句柄字段。"""
+        hwnd = getattr(win, "hwnd", None) or getattr(win, "_hWnd", None)
         try:
-            pyautogui.click(win.left + min(40, max(10, win.width // 20)), win.top + 20)
+            return int(hwnd) if hwnd else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _is_wechat_foreground(hwnd: int) -> bool:
+        """仅接受微信主窗口或其所属弹出窗口处于前台。"""
+        try:
+            import win32con
+            import win32gui
+
+            foreground = int(win32gui.GetForegroundWindow() or 0)
+            if not foreground:
+                return False
+            if foreground == int(hwnd):
+                return True
+            root_owner = int(
+                win32gui.GetAncestor(foreground, win32con.GA_ROOTOWNER) or 0
+            )
+            return root_owner == int(hwnd)
         except Exception:
-            pass
-        time.sleep(0.1)
+            return False
+
+    @staticmethod
+    def _request_wechat_foreground(hwnd: int) -> None:
+        """通过 Win32 线程输入关联请求前台，不发送任何键盘快捷键。"""
+        import win32api
+        import win32con
+        import win32gui
+        import win32process
+
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        else:
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+
+        current_thread = win32api.GetCurrentThreadId()
+        target_thread, _target_pid = win32process.GetWindowThreadProcessId(hwnd)
+        foreground = win32gui.GetForegroundWindow()
+        foreground_thread = 0
+        if foreground:
+            foreground_thread, _foreground_pid = (
+                win32process.GetWindowThreadProcessId(foreground)
+            )
+
+        attached_threads: list[int] = []
+        try:
+            for thread_id in (foreground_thread, target_thread):
+                if (
+                    thread_id
+                    and thread_id != current_thread
+                    and thread_id not in attached_threads
+                ):
+                    win32process.AttachThreadInput(current_thread, thread_id, True)
+                    attached_threads.append(thread_id)
+
+            win32gui.BringWindowToTop(hwnd)
+            win32gui.SetForegroundWindow(hwnd)
+            try:
+                win32gui.SetActiveWindow(hwnd)
+            except Exception:
+                # SetForegroundWindow 的结果会在调用方再次读取并严格校验。
+                pass
+        finally:
+            for thread_id in reversed(attached_threads):
+                try:
+                    win32process.AttachThreadInput(current_thread, thread_id, False)
+                except Exception:
+                    pass
+
+    def _assert_wechat_foreground(self, action: str) -> None:
+        """鼠标操作前后校验微信前台状态，焦点变化时立即失败关闭。"""
+        hwnd = self._active_wechat_hwnd
+        if hwnd and self._is_wechat_foreground(hwnd):
+            return
+        self._active_wechat_hwnd = None
+        logger.error("检测到前台焦点已离开微信，已中止 GUI 操作 | action=%s", action)
+        raise RuntimeError(f"执行{action}前微信已失去前台焦点")
+
+    def _get_active_wechat_window(self):
+        """返回已验证的同一个微信主窗口，拒绝窗口句柄漂移。"""
+        self._assert_wechat_foreground("读取微信窗口位置")
+        win = self._find_wechat_window()
+        if win is None:
+            raise RuntimeError("未找到微信窗口")
+        hwnd = self._window_hwnd(win)
+        if not hwnd or hwnd != self._active_wechat_hwnd:
+            self._active_wechat_hwnd = None
+            raise RuntimeError("微信主窗口发生变化，已中止本次 GUI 操作")
+        return win
+
+    def _guarded_click(self, x: int, y: int, action: str) -> None:
+        """只允许在微信保持前台时执行一次左键点击。"""
+        self._assert_wechat_foreground(action)
+        pyautogui.click(x, y)
+        time.sleep(0.03)
+        self._assert_wechat_foreground(action)
+
+    def _guarded_right_click(self, x: int, y: int, action: str) -> None:
+        """只允许在微信保持前台时执行一次右键点击。"""
+        self._assert_wechat_foreground(action)
+        pyautogui.rightClick(x, y)
+        time.sleep(0.03)
+        self._assert_wechat_foreground(action)
 
     def _ensure_window_visible(self, win):
         """把非最大化微信窗口挪回屏幕内，避免发送按钮位于屏幕外。"""
@@ -443,7 +577,7 @@ class WindowsSender(BaseMessageSender):
     def _focus_search_input(self) -> tuple[int, int]:
         """点击微信左侧搜索框。"""
         x, y = self._window_offset_point(self._search_x_offset, self._search_y_offset)
-        pyautogui.click(x, y)
+        self._guarded_click(x, y, "聚焦微信搜索框")
         time.sleep(0.15)
         return x, y
 
@@ -453,7 +587,7 @@ class WindowsSender(BaseMessageSender):
             self._search_clear_x_offset,
             self._search_clear_y_offset,
         )
-        pyautogui.click(x, y)
+        self._guarded_click(x, y, "清空微信搜索框")
         time.sleep(0.15)
 
     def _click_first_search_result(self) -> None:
@@ -462,7 +596,7 @@ class WindowsSender(BaseMessageSender):
             self._search_result_x_offset,
             self._search_result_y_offset,
         )
-        pyautogui.click(x, y)
+        self._guarded_click(x, y, "选择微信搜索结果")
         time.sleep(0.15)
 
     def _click_group_search_result(self) -> None:
@@ -471,14 +605,12 @@ class WindowsSender(BaseMessageSender):
             self._group_search_result_x_offset,
             self._group_search_result_y_offset,
         )
-        pyautogui.click(x, y)
+        self._guarded_click(x, y, "选择微信群聊搜索结果")
         time.sleep(0.15)
 
     def _focus_message_input(self) -> tuple[int, int]:
         """点击消息输入区域，确保光标在输入框内。"""
-        win = self._find_wechat_window()
-        if win is None:
-            raise RuntimeError("未找到微信窗口")
+        win = self._get_active_wechat_window()
 
         try:
             x = win.left + int(win.width * self._click_x_ratio)
@@ -489,31 +621,36 @@ class WindowsSender(BaseMessageSender):
             x = int(x * self._click_x_ratio)
             y = int(y * self._click_y_ratio)
 
-        pyautogui.click(x, y)
+        self._guarded_click(x, y, "聚焦微信消息输入框")
         time.sleep(0.15)
-        pyautogui.click(x, y)  # 双击确保焦点
+        self._guarded_click(x, y, "再次聚焦微信消息输入框")
         time.sleep(0.1)
         return x, y
 
     def _paste_text(self, text: str, x: int, y: int) -> None:
         """粘贴文本，不使用 Ctrl+V。"""
+        self._assert_wechat_foreground("粘贴微信文本")
         pyperclip.copy(text)
         time.sleep(0.05)
         if self._paste_method == "context_menu":
             self._paste_text_via_context_menu(x, y)
             return
 
-        win = self._find_wechat_window()
-        hwnd = getattr(win, "hwnd", None) if win else None
+        hwnd = self._active_wechat_hwnd
         if hwnd:
             self._post_paste_to_focused_control(hwnd)
         time.sleep(0.3)
+        self._assert_wechat_foreground("完成微信文本粘贴")
 
     def _paste_text_via_context_menu(self, x: int, y: int) -> None:
         """使用微信输入框右键菜单的“粘贴”，避开快捷键和 Qt 控件 WM_PASTE 限制。"""
-        pyautogui.rightClick(x, y)
+        self._guarded_right_click(x, y, "打开微信粘贴菜单")
         time.sleep(self._context_menu_delay)
-        pyautogui.click(x + self._paste_menu_x_offset, y + self._paste_menu_y_offset)
+        self._guarded_click(
+            x + self._paste_menu_x_offset,
+            y + self._paste_menu_y_offset,
+            "点击微信粘贴菜单",
+        )
         time.sleep(0.3)
 
     @staticmethod
@@ -552,20 +689,16 @@ class WindowsSender(BaseMessageSender):
 
     def _click_send_button(self) -> None:
         """点击微信输入区右下角发送按钮。"""
-        win = self._find_wechat_window()
-        if win is None:
-            raise RuntimeError("未找到微信窗口")
+        win = self._get_active_wechat_window()
         x = win.left + win.width - self._send_button_x_from_right
         y = win.top + win.height - self._send_button_y_from_bottom
         time.sleep(0.15)
-        pyautogui.click(x, y)
+        self._guarded_click(x, y, "点击微信发送按钮")
         time.sleep(0.3)
 
     def _window_offset_point(self, x_offset: int, y_offset: int) -> tuple[int, int]:
         """按微信窗口左上角固定偏移取点，适配默认窗口和最大化窗口。"""
-        win = self._find_wechat_window()
-        if win is None:
-            raise RuntimeError("未找到微信窗口")
+        win = self._get_active_wechat_window()
         x = win.left + min(max(int(x_offset), 1), max(win.width - 1, 1))
         y = win.top + min(max(int(y_offset), 1), max(win.height - 1, 1))
         return x, y

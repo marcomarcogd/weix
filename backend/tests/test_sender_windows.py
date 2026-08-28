@@ -34,7 +34,7 @@ def mock_pyautogui():
 
 class FakeWindow:
     """模拟 pygetwindow 窗口对象。"""
-    def __init__(self, left=0, top=0, width=1200, height=800, hwnd=None):
+    def __init__(self, left=0, top=0, width=1200, height=800, hwnd=123):
         self.left = left
         self.top = top
         self.width = width
@@ -63,6 +63,7 @@ def _mock_window(sender, window=None):
     if window is None:
         window = FakeWindow()
     sender._find_wechat_window = MagicMock(return_value=window)
+    sender._is_wechat_foreground = MagicMock(return_value=True)
     return window
 
 
@@ -215,6 +216,49 @@ def test_unconfirmed_send_is_never_retried():
     sender._click_send_button.assert_called_once_with()
     sender._full_search.assert_not_called()
     assert sender._last_receiver == ""
+
+
+def test_activate_wechat_aborts_when_foreground_cannot_be_obtained():
+    """激活重试后仍不是微信前台时，必须在任何鼠标点击前中止。"""
+    sender = _make_sender()
+    window = FakeWindow(hwnd=123)
+    sender._find_wechat_window = MagicMock(return_value=window)
+    sender._ensure_window_visible = MagicMock(return_value=window)
+    sender._is_wechat_foreground = MagicMock(return_value=False)
+    sender._request_wechat_foreground = MagicMock()
+
+    with pytest.raises(RuntimeError, match="未成功切换到前台"):
+        sender._activate_wechat()
+
+    assert sender._request_wechat_foreground.call_count == 3
+    assert sender._active_wechat_hwnd is None
+    pyautogui.click.assert_not_called()
+    pyautogui.rightClick.assert_not_called()
+
+
+def test_context_menu_paste_aborts_when_chrome_has_focus():
+    """Chrome 抢焦点后不得右击，以免误触 Google 识图菜单。"""
+    sender = _make_sender()
+    sender._active_wechat_hwnd = 123
+    sender._is_wechat_foreground = MagicMock(return_value=False)
+
+    with pytest.raises(RuntimeError, match="失去前台焦点"):
+        sender._paste_text_via_context_menu(100, 200)
+
+    pyautogui.rightClick.assert_not_called()
+    pyautogui.click.assert_not_called()
+
+
+def test_guarded_click_detects_focus_stolen_after_click():
+    """点击期间焦点被抢走时必须立即报错，不再执行后续动作。"""
+    sender = _make_sender()
+    sender._active_wechat_hwnd = 123
+    sender._is_wechat_foreground = MagicMock(side_effect=[True, False])
+
+    with pytest.raises(RuntimeError, match="失去前台焦点"):
+        sender._guarded_click(100, 200, "测试点击")
+
+    pyautogui.click.assert_called_once_with(100, 200)
 
 
 def test_pre_send_skip_failure_falls_back_to_one_full_search():
