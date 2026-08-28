@@ -10,6 +10,7 @@ import asyncio
 import ctypes
 import logging
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -22,6 +23,7 @@ from app.core.send_result import SendResult
 logger = logging.getLogger(__name__)
 
 MAIN_CLASS = "mmui::MainWindow"
+NATIVE_MAIN_CLASS_RE = re.compile(r"^Qt\d+QWindowIcon(?:[A-Za-z0-9_]*)$")
 MAIN_NAMES = {"微信", "Weixin"}
 SEARCH_EDIT_CLASS = "mmui::XValidatorTextEdit"
 SEARCH_EDIT_NAME = "搜索"
@@ -59,6 +61,11 @@ def _is_visible(control: Any) -> bool:
         return float(rect.right) > float(rect.left) and float(rect.bottom) > float(rect.top)
     except Exception:
         return False
+
+
+def _is_supported_main_class(class_name: str) -> bool:
+    """识别微信公开的 mmui 主树或 Qt 原生主窗口外壳。"""
+    return class_name == MAIN_CLASS or bool(NATIVE_MAIN_CLASS_RE.fullmatch(class_name))
 
 
 class DirectUIAAdapter:
@@ -138,10 +145,10 @@ class DirectUIAAdapter:
                 "uia_identity_mismatch",
                 "UIA 控件所属 PID 或窗口句柄与已绑定微信不一致",
             )
-        if class_name != MAIN_CLASS:
+        if not _is_supported_main_class(class_name):
             raise UIAWindowError(
-                "uia_tree_unavailable",
-                f"微信窗口已找到，但 UIA 树尚未物化（当前类名: {class_name or '-'}）",
+                "uia_identity_mismatch",
+                f"UIA 主窗口类名不是受支持的微信窗口（当前类名: {class_name or '-'}）",
             )
         if activate:
             self.activate(window, pid)
@@ -544,6 +551,7 @@ class WindowsUIASender:
             adapter = self._get_adapter()
             window = adapter.main_window(int(binding["bound_pid"]), activate=False)
             result["main_window"] = True
+            result["window_class"] = str(_safe_attr(window, "ClassName", "") or "")
             try:
                 adapter.search_box(window)
                 result["search_box"] = True
@@ -554,9 +562,11 @@ class WindowsUIASender:
                 result["session_list"] = True
             except Exception:
                 pass
+            descendants = adapter.descendants(window)
+            result["descendant_count"] = len(descendants)
             inputs = [
                 item
-                for item in adapter.descendants(window)
+                for item in descendants
                 if str(_safe_attr(item, "AutomationId", "") or "") == CHAT_INPUT_AID
                 and _is_visible(item)
             ]
@@ -575,9 +585,27 @@ class WindowsUIASender:
                 result["reason"] = "UIA 关键控件已就绪"
                 result["reason_code"] = ""
             else:
-                result["reason"] = "微信 UIA 树缺少关键控件"
+                missing = [
+                    label
+                    for key, label in (
+                        ("search_box", "搜索框"),
+                        ("session_list", "会话列表"),
+                        ("chat_input", "输入框"),
+                        ("send_button", "发送按钮"),
+                    )
+                    if not result[key]
+                ]
+                result["reason"] = "微信 UIA 树缺少关键控件：" + "、".join(missing)
                 result["reason_code"] = "uia_controls_missing"
-                result["narrator_hint"] = True
+                is_native_shell = bool(
+                    NATIVE_MAIN_CLASS_RE.fullmatch(result["window_class"])
+                )
+                result["narrator_hint"] = not is_native_shell
+                if is_native_shell:
+                    result["help"] = (
+                        "已安全连接微信原生窗口；若重新检测后仍缺少控件，"
+                        "说明当前微信没有向系统公开完整 UIA 树，程序会保持静默。"
+                    )
         except UIAWindowError as exc:
             result["reason"] = str(exc)
             result["reason_code"] = exc.code

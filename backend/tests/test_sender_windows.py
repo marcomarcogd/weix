@@ -618,11 +618,11 @@ def test_direct_uia_main_window_rejects_wrong_pid_before_uia_access():
     auto.ControlFromHandle.assert_not_called()
 
 
-def test_direct_uia_main_window_reports_unmaterialized_tree():
-    from app.core.sender_windows_uia import DirectUIAAdapter, UIAWindowError
+def test_direct_uia_main_window_accepts_verified_native_qt_shell():
+    from app.core.sender_windows_uia import DirectUIAAdapter
 
     shell = SimpleNamespace(
-        ClassName="Qt5152QWindowIcon",
+        ClassName="Qt51514QWindowIcon",
         Name="微信",
         ProcessId=4321,
         NativeWindowHandle=123,
@@ -637,10 +637,34 @@ def test_direct_uia_main_window_reports_unmaterialized_tree():
         patch("win32gui.IsWindowVisible", return_value=True),
         patch("win32gui.GetWindowRect", return_value=(0, 0, 1200, 800)),
     ):
+        result = adapter.main_window(4321)
+
+    assert result is shell
+
+
+def test_direct_uia_main_window_rejects_unrelated_uia_class():
+    from app.core.sender_windows_uia import DirectUIAAdapter, UIAWindowError
+
+    unrelated = SimpleNamespace(
+        ClassName="Chrome_WidgetWin_1",
+        Name="微信",
+        ProcessId=4321,
+        NativeWindowHandle=123,
+    )
+    adapter = object.__new__(DirectUIAAdapter)
+    adapter.auto = SimpleNamespace(ControlFromHandle=MagicMock(return_value=unrelated))
+
+    with (
+        patch("win32gui.EnumWindows", side_effect=lambda callback, extra: callback(123, extra)),
+        patch("win32process.GetWindowThreadProcessId", return_value=(1, 4321)),
+        patch("win32gui.GetWindowText", return_value="微信"),
+        patch("win32gui.IsWindowVisible", return_value=True),
+        patch("win32gui.GetWindowRect", return_value=(0, 0, 1200, 800)),
+    ):
         with pytest.raises(UIAWindowError) as captured:
             adapter.main_window(4321)
 
-    assert captured.value.code == "uia_tree_unavailable"
+    assert captured.value.code == "uia_identity_mismatch"
 
 
 def test_uia_diagnosis_distinguishes_missing_visible_window():
@@ -661,6 +685,31 @@ def test_uia_diagnosis_distinguishes_missing_visible_window():
     assert diagnosis["reason_code"] == "window_not_found"
     assert diagnosis["narrator_hint"] is False
     assert "打开" in diagnosis["help"]
+
+
+def test_uia_diagnosis_checks_controls_inside_verified_native_shell():
+    from app.core.sender_windows_uia import WindowsUIASender
+
+    shell = SimpleNamespace(ClassName="Qt51514QWindowIcon")
+    adapter = MagicMock()
+    adapter.main_window.return_value = shell
+    adapter.search_box.side_effect = RuntimeError("missing")
+    adapter.session_list.side_effect = RuntimeError("missing")
+    adapter.descendants.return_value = []
+    sender = WindowsUIASender(
+        adapter_factory=lambda: adapter,
+        binding_provider=_uia_binding,
+    )
+
+    diagnosis = sender._diagnose_sync()
+
+    assert diagnosis["main_window"] is True
+    assert diagnosis["window_class"] == "Qt51514QWindowIcon"
+    assert diagnosis["descendant_count"] == 0
+    assert diagnosis["reason_code"] == "uia_controls_missing"
+    assert diagnosis["narrator_hint"] is False
+    assert "搜索框" in diagnosis["reason"]
+    assert "保持静默" in diagnosis["help"]
 
 
 class FakeControl:
