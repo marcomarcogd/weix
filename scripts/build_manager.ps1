@@ -13,9 +13,11 @@ $env:PYTHONIOENCODING = "utf-8"
 $ProjectDir = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $PythonExe = Join-Path $ProjectDir "venv\Scripts\python.exe"
 $Launcher = Join-Path $ProjectDir "backend\launcher.py"
+$SpecFile = Join-Path $ProjectDir "scripts\weix_manager.spec"
 $DistDir = Join-Path $ProjectDir "dist"
 $WorkDir = Join-Path $ProjectDir "build\manager"
 $OutputExe = Join-Path $DistDir "WeixManager.exe"
+$ArchiveViewer = Join-Path $ProjectDir "venv\Scripts\pyi-archive_viewer.exe"
 $env:UV_CACHE_DIR = Join-Path $ProjectDir "build\uv-cache"
 $UvExe = $null
 $UvCommand = Get-Command uv.exe -ErrorAction SilentlyContinue
@@ -34,6 +36,9 @@ if (-not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) {
 }
 if (-not (Test-Path -LiteralPath $Launcher -PathType Leaf)) {
     throw "未找到管理器入口：$Launcher"
+}
+if (-not (Test-Path -LiteralPath $SpecFile -PathType Leaf)) {
+    throw "未找到管理器打包配置：$SpecFile"
 }
 
 Write-Host "[1/3] 检查 PyInstaller..."
@@ -60,20 +65,43 @@ New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 
 Write-Host "[2/3] 构建无命令行窗口的 WeixManager.exe..."
 $PyInstallerArgs = @(
-    "--name=WeixManager"
-    "--onefile"
-    "--windowed"
     "--noconfirm"
     "--clean"
     "--distpath=$DistDir"
     "--workpath=$WorkDir"
-    "--specpath=$WorkDir"
-    "--hidden-import=psutil._psutil_windows"
-    $Launcher
+    $SpecFile
 )
-& $PythonExe -m PyInstaller @PyInstallerArgs
-if ($LASTEXITCODE -ne 0) {
-    throw "WeixManager.exe 构建失败"
+$PythonDirectory = [System.IO.Path]::GetDirectoryName($PythonExe)
+$PythonBase = (& $PythonExe -c "import sys; print(sys.base_prefix)").Trim()
+$QtBin = (& $PythonExe -c "from pathlib import Path; import PyQt6; print(Path(PyQt6.__file__).parent / 'Qt6' / 'bin')").Trim()
+$OriginalPath = $env:PATH
+$OriginalProjectRoot = $env:WEIX_MANAGER_PROJECT_ROOT
+$BuildPath = @(
+    $QtBin
+    $PythonDirectory
+    $PythonBase
+    (Join-Path $env:SystemRoot "System32")
+    $env:SystemRoot
+) | Select-Object -Unique
+
+try {
+    # PyInstaller 会扫描 PATH 查找 DLL。隔离 Codex/Poppler 等外部运行库，
+    # 避免把不兼容的同名 ICU DLL 误打包到应用根目录。
+    $env:PATH = $BuildPath -join [System.IO.Path]::PathSeparator
+    $env:WEIX_MANAGER_PROJECT_ROOT = $ProjectDir
+    & $PythonExe -m PyInstaller @PyInstallerArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "WeixManager.exe 构建失败"
+    }
+}
+finally {
+    $env:PATH = $OriginalPath
+    if ($null -eq $OriginalProjectRoot) {
+        Remove-Item Env:WEIX_MANAGER_PROJECT_ROOT -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:WEIX_MANAGER_PROJECT_ROOT = $OriginalProjectRoot
+    }
 }
 if (-not (Test-Path -LiteralPath $OutputExe -PathType Leaf)) {
     throw "构建完成但未找到产物：$OutputExe"
@@ -89,6 +117,23 @@ foreach ($ForbiddenInput in $ForbiddenInputs) {
     if ($PyInstallerArgs -contains $ForbiddenInput) {
         throw "构建参数意外包含敏感文件：$ForbiddenInput"
     }
+}
+if (-not (Test-Path -LiteralPath $ArchiveViewer -PathType Leaf)) {
+    throw "未找到 PyInstaller 打包清单检查工具：$ArchiveViewer"
+}
+$ArchiveEntries = & $ArchiveViewer -l $OutputExe
+if ($LASTEXITCODE -ne 0) {
+    throw "无法读取 WeixManager.exe 打包清单"
+}
+$ConflictingIcu = $ArchiveEntries | Where-Object {
+    $_ -match ", 'icu(?:uc|dt\d+)\.dll'\s*$"
+}
+if ($ConflictingIcu) {
+    throw "构建产物包含应用根目录 ICU DLL，可能导致 QtCore 无法加载"
+}
+$SensitiveArchivePattern = "config[\\/]config\.yaml|all_keys\.json|[\\/']\.env(?:[\\/']|$)|manager\.log|backend\.log|frontend\.log"
+if ($ArchiveEntries -match $SensitiveArchivePattern) {
+    throw "构建产物意外包含配置、密钥或日志文件"
 }
 
 $Item = Get-Item -LiteralPath $OutputExe

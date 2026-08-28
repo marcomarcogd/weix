@@ -8,6 +8,7 @@ build/
 .eggs/
 *.manifest
 *.spec
+!scripts/weix_manager.spec
 
 # Virtual environment
 venv/
