@@ -78,7 +78,7 @@ windows_sender:
   window_activate_delay: 0.5
 
 monitor:
-  poll_interval: 2
+  poll_interval: 0.5
 
 platform: auto
 

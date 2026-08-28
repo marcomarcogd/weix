@@ -39,7 +39,7 @@ SYSTEM_MSG_PATTERNS = {
 class MonitorConfig:
     """消息监听器配置。"""
 
-    poll_interval: float = 2.0  # 轮询间隔 (秒)
+    poll_interval: float = 0.5  # 轮询间隔 (秒)
     max_batch_size: int = 100  # 单次批量最大消息数
     dedup_window: int = 3600  # 去重窗口 (秒)
     retry_delay: float = 5.0  # 错误重试延迟 (秒)
@@ -83,7 +83,7 @@ class MessageMonitor:
             )
             config = MonitorConfig(
                 poll_interval=float(
-                    monitor_cfg.get("poll_interval", 2.0)
+                    monitor_cfg.get("poll_interval", 0.5)
                 ),
             )
 
@@ -187,6 +187,7 @@ class MessageMonitor:
         定期查询数据库中的新消息，去重后推送到队列。
         """
         while self._running:
+            cycle_started = time.monotonic()
             try:
                 messages = await self._poll_once()
                 for msg in messages:
@@ -214,7 +215,12 @@ class MessageMonitor:
                 await self._sleep_or_stop(self._config.retry_delay)
                 continue
 
-            await self._sleep_or_stop(self._config.poll_interval)
+            # poll_interval 表示两轮开始时间的目标间隔，查询耗时不再额外
+            # 叠加到等待时间。保留 50ms 下限，避免数据库异常缓慢时空转。
+            elapsed = time.monotonic() - cycle_started
+            await self._sleep_or_stop(
+                max(0.05, self._config.poll_interval - elapsed)
+            )
 
     async def _sleep_or_stop(self, delay: float) -> None:
         """等待下一轮轮询，停止时立即唤醒。"""

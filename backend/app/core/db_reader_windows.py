@@ -36,6 +36,9 @@ HMAC_SIZE = 64
 # SQLCipher4 HMAC-SHA512: IV(16) + HMAC(64)
 RESERVED_SIZE = 80
 SQLITE_HEADER = b"SQLite format 3\x00"
+WAL_HEADER_SIZE = 32
+WAL_FRAME_HEADER_SIZE = 24
+WAL_FRAME_SIZE = WAL_FRAME_HEADER_SIZE + PAGE_SIZE
 # 消息类型常量
 MSG_TYPE_TEXT = 1
 MSG_TYPE_IMAGE = 3
@@ -67,7 +70,9 @@ class WindowsDBReader(BaseDBReader):
         r"E:\xwechat_files",
     ]
 
-    REFRESH_INTERVAL = 1.5  # 刷新间隔（秒），避免每 2s 轮询都重新解密整库
+    # 消息监听器默认每 0.5 秒轮询。这里只限制磁盘签名检查频率；
+    # 实际刷新优先合并几 MB 的 WAL，不再每轮解密整个消息库。
+    REFRESH_INTERVAL = 0.25
 
     def __init__(self):
         self._key: Optional[bytes] = None
@@ -84,6 +89,15 @@ class WindowsDBReader(BaseDBReader):
         self._msg_table_cache: Optional[list[tuple[str, str]]] = None
         self._name2id_cache: Optional[dict[int, str]] = None
         self._last_refresh: float = 0
+        self._source_signature: Optional[tuple[int, int]] = None
+        self._wal_signature: Optional[tuple[int, int]] = None
+        self._last_empty_query_key: Optional[
+            tuple[
+                int,
+                Optional[tuple[int, int]],
+                Optional[tuple[int, int]],
+            ]
+        ] = None
         self._current_sender_id: Optional[int] = None
         self._direction_warning_logged: bool = False
 
@@ -122,15 +136,14 @@ class WindowsDBReader(BaseDBReader):
         if not self._derive_key():
             return False
 
-        # 解密整个数据库到临时文件
+        # 首次打开仍需生成完整解密快照；后续消息通过 WAL 增量合并。
         try:
-            self._decrypted_path = self._decrypt_to_temp()
-            self._sqlite_conn = sqlite3.connect(
-                f"file:{self._decrypted_path}?mode=ro",
-                uri=True,
-                check_same_thread=False,
-            )
-            self._sqlite_conn.row_factory = sqlite3.Row
+            (
+                self._decrypted_path,
+                self._sqlite_conn,
+                self._source_signature,
+                self._wal_signature,
+            ) = self._build_full_snapshot()
             self._last_refresh = time.monotonic()
             logger.info("数据库打开成功")
             return True
@@ -139,10 +152,11 @@ class WindowsDBReader(BaseDBReader):
             return False
 
     def refresh(self) -> bool:
-        """重新解密源数据库以获取最新消息。
+        """刷新解密快照以获取最新消息。
 
-        WeChat 持续写入原始加密库，而 open_db() 创建的是静态临时副本。
-        此方法重新解密并替换旧副本，使后续查询能看到新消息。
+        主库未变化时只合并 WAL 中已提交的新页面；仅当微信 checkpoint
+        改写主库时才重新生成完整快照。WAL 合并失败会恢复原页面并保留
+        旧连接，不会让查询读到半写入状态。
 
         Returns:
             True 表示刷新成功。
@@ -151,30 +165,21 @@ class WindowsDBReader(BaseDBReader):
             return False
         try:
             with self._lock:
-                old_path = self._decrypted_path
-                old_conn = self._sqlite_conn
-                self._decrypted_path = self._decrypt_to_temp()
-                self._sqlite_conn = sqlite3.connect(
-                    f"file:{self._decrypted_path}?mode=ro",
-                    uri=True,
-                    check_same_thread=False,
-                )
-                self._sqlite_conn.row_factory = sqlite3.Row
-                self._msg_table_cache = None
-                self._name2id_cache = None
-                self._current_sender_id = None
-                self._direction_warning_logged = False
+                source_signature = self._file_signature(self._db_path)
+                wal_signature = self._file_signature(self._wal_path())
+
+                if (
+                    source_signature == self._source_signature
+                    and wal_signature == self._wal_signature
+                ):
+                    self._last_refresh = time.monotonic()
+                    return True
+
+                if source_signature != self._source_signature:
+                    self._replace_with_full_snapshot_locked()
+                else:
+                    self._refresh_from_wal_locked()
                 self._last_refresh = time.monotonic()
-            if old_conn:
-                try:
-                    old_conn.close()
-                except Exception:
-                    pass
-            if old_path:
-                try:
-                    os.unlink(old_path)
-                except Exception:
-                    pass
             return True
         except Exception as exc:
             logger.error(f"刷新数据库副本失败: {exc}")
@@ -198,7 +203,16 @@ class WindowsDBReader(BaseDBReader):
             self.refresh()
 
         if self._has_msg_shard_tables():
-            return self._query_v4_messages_since(timestamp)
+            query_key = (
+                int(timestamp),
+                self._source_signature,
+                self._wal_signature,
+            )
+            if query_key == self._last_empty_query_key:
+                return []
+            messages = self._query_v4_messages_since(timestamp)
+            self._last_empty_query_key = query_key if not messages else None
+            return messages
 
         try:
             cursor = self._sqlite_conn.execute(
@@ -530,6 +544,9 @@ class WindowsDBReader(BaseDBReader):
                         except Exception:
                             pass
                 self._decrypted_path = ""
+            self._source_signature = None
+            self._wal_signature = None
+            self._last_empty_query_key = None
 
     def __del__(self) -> None:
         self.close()
@@ -1111,13 +1128,351 @@ class WindowsDBReader(BaseDBReader):
             or decrypted[:2] == b"\x10\x00"
         )
 
-    @staticmethod
-    def _rebuild_page1(decrypted: bytes) -> bytes:
+    def _rebuild_page1(self, decrypted: bytes) -> bytes:
         """把 page 1 解密片段还原成普通 SQLite page。"""
         if decrypted[:16] == SQLITE_HEADER:
             padding = b"\x00" * (PAGE_SIZE - len(decrypted))
             return decrypted + padding
-        return SQLITE_HEADER + decrypted + b"\x00" * RESERVED_SIZE
+        return SQLITE_HEADER + decrypted + b"\x00" * self._reserve_size
+
+    @staticmethod
+    def _file_signature(path: str) -> Optional[tuple[int, int]]:
+        """返回文件大小和纳秒修改时间；文件不存在时返回 None。"""
+        if not path:
+            return None
+        try:
+            stat = os.stat(path)
+            return stat.st_size, stat.st_mtime_ns
+        except FileNotFoundError:
+            return None
+
+    def _wal_path(self) -> str:
+        return f"{self._db_path}-wal" if self._db_path else ""
+
+    @staticmethod
+    def _open_decrypted_connection(path: str) -> sqlite3.Connection:
+        conn = sqlite3.connect(
+            f"file:{path}?mode=ro",
+            uri=True,
+            check_same_thread=False,
+        )
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        except Exception:
+            conn.close()
+            raise
+        return conn
+
+    def _invalidate_runtime_caches(self) -> None:
+        self._msg_table_cache = None
+        self._name2id_cache = None
+        self._current_sender_id = None
+        self._direction_warning_logged = False
+        self._last_empty_query_key = None
+
+    def _build_full_snapshot(
+        self,
+    ) -> tuple[str, sqlite3.Connection, tuple[int, int], Optional[tuple[int, int]]]:
+        """生成稳定的完整快照，并尽量合并当前 WAL 已提交页面。"""
+        decrypted_path = ""
+        source_signature: Optional[tuple[int, int]] = None
+
+        for attempt in range(2):
+            before = self._file_signature(self._db_path)
+            if before is None:
+                raise FileNotFoundError(self._db_path)
+            candidate = self._decrypt_to_temp()
+            after = self._file_signature(self._db_path)
+            if before == after:
+                decrypted_path = candidate
+                source_signature = after
+                break
+            try:
+                os.unlink(candidate)
+            except OSError:
+                pass
+            if attempt == 0:
+                logger.warning(
+                    "完整解密期间微信主库发生 checkpoint，准备重新读取一次"
+                )
+
+        if not decrypted_path or source_signature is None:
+            raise RuntimeError("微信主库持续变化，暂时无法生成一致快照")
+
+        wal_signature: Optional[tuple[int, int]] = None
+        try:
+            wal_signature, wal_data = self._read_wal_snapshot()
+            pages, frame_count, db_size = self._collect_committed_wal_pages(wal_data)
+            if pages:
+                self._write_decrypted_pages(decrypted_path, pages, db_size)
+                logger.info(
+                    "完整快照已合并 WAL: frames=%d, pages=%d",
+                    frame_count,
+                    len(pages),
+                )
+        except Exception as exc:
+            # 完整主库本身仍可安全读取。保留 wal_signature=None，下一轮会重试。
+            wal_signature = None
+            logger.warning("首次 WAL 合并未完成，将在下一轮重试: %s", exc)
+
+        try:
+            conn = self._open_decrypted_connection(decrypted_path)
+        except Exception:
+            try:
+                os.unlink(decrypted_path)
+            except OSError:
+                pass
+            raise
+        return decrypted_path, conn, source_signature, wal_signature
+
+    def _replace_with_full_snapshot_locked(self) -> None:
+        old_path = self._decrypted_path
+        old_conn = self._sqlite_conn
+        new_path, new_conn, source_signature, wal_signature = (
+            self._build_full_snapshot()
+        )
+
+        self._decrypted_path = new_path
+        self._sqlite_conn = new_conn
+        self._source_signature = source_signature
+        self._wal_signature = wal_signature
+        self._invalidate_runtime_caches()
+
+        if old_conn:
+            try:
+                old_conn.close()
+            except Exception:
+                pass
+        if old_path:
+            try:
+                os.unlink(old_path)
+            except OSError:
+                pass
+
+    def _read_wal_snapshot(self) -> tuple[Optional[tuple[int, int]], bytes]:
+        """读取一次稳定的 WAL 内容；微信写入期间发生变化则留到下一轮。"""
+        wal_path = self._wal_path()
+        before = self._file_signature(wal_path)
+        if before is None:
+            return None, b""
+        if before[0] <= WAL_HEADER_SIZE:
+            return before, b""
+
+        with open(wal_path, "rb") as wal:
+            data = wal.read(before[0])
+        after = self._file_signature(wal_path)
+        if before != after or len(data) != before[0]:
+            raise RuntimeError("WAL 正在写入，本轮跳过以避免读取半帧")
+        return after, data
+
+    def _collect_committed_wal_pages(
+        self,
+        wal_data: bytes,
+    ) -> tuple[dict[int, bytes], int, int]:
+        """解析同一 WAL 世代中最后一次提交前的加密页面。"""
+        if len(wal_data) <= WAL_HEADER_SIZE:
+            return {}, 0, 0
+        if not self._aes_key or not self._hmac_key:
+            raise RuntimeError("WAL 解密密钥尚未派生")
+
+        magic, _version, wal_page_size = struct.unpack(">III", wal_data[:12])
+        if magic not in (0x377F0682, 0x377F0683):
+            raise RuntimeError("无法识别 WAL 文件头")
+        if wal_page_size == 1:
+            wal_page_size = 65536
+        if wal_page_size != PAGE_SIZE:
+            raise RuntimeError(f"WAL 页面大小不受支持: {wal_page_size}")
+
+        wal_salt = wal_data[16:24]
+        total_frames = (len(wal_data) - WAL_HEADER_SIZE) // WAL_FRAME_SIZE
+        frames: list[tuple[int, int, int, bytes]] = []
+        last_commit_index = -1
+        committed_db_size = 0
+
+        for index in range(total_frames):
+            offset = WAL_HEADER_SIZE + index * WAL_FRAME_SIZE
+            header = wal_data[offset:offset + WAL_FRAME_HEADER_SIZE]
+            page = wal_data[
+                offset + WAL_FRAME_HEADER_SIZE:offset + WAL_FRAME_SIZE
+            ]
+            if len(header) != WAL_FRAME_HEADER_SIZE or len(page) != PAGE_SIZE:
+                break
+            page_number, commit_size = struct.unpack(">II", header[:8])
+            if header[8:16] != wal_salt or page_number <= 0:
+                continue
+            frames.append((index, page_number, commit_size, page))
+            if commit_size:
+                last_commit_index = index
+                committed_db_size = commit_size
+
+        if last_commit_index < 0:
+            return {}, 0, 0
+
+        pages: dict[int, bytes] = {}
+        applied_frames = 0
+        for index, page_number, _commit_size, page in frames:
+            if index > last_commit_index:
+                continue
+            if committed_db_size and page_number > committed_db_size:
+                continue
+            if not self._verify_page_hmac(
+                page,
+                self._hmac_key,
+                self._reserve_size,
+                self._hmac_hash,
+                page_number=page_number,
+            ):
+                raise RuntimeError(
+                    f"WAL 第 {index + 1} 帧 HMAC 校验失败，本轮不合并"
+                )
+            pages[page_number] = self._decrypt_encrypted_page(page, page_number)
+            applied_frames += 1
+
+        return pages, applied_frames, committed_db_size
+
+    def _decrypt_encrypted_page(self, page: bytes, page_number: int) -> bytes:
+        if not self._aes_key or len(page) != PAGE_SIZE:
+            raise RuntimeError("无法解密不完整页面")
+        reserved = page[PAGE_SIZE - self._reserve_size:PAGE_SIZE]
+        iv = reserved[:IV_SIZE]
+        if page_number == 1:
+            encrypted = page[SALT_SIZE:PAGE_SIZE - self._reserve_size]
+        else:
+            encrypted = page[:PAGE_SIZE - self._reserve_size]
+        decrypted = AES.new(self._aes_key, AES.MODE_CBC, iv=iv).decrypt(encrypted)
+        if page_number == 1:
+            return self._rebuild_page1(decrypted)
+        return decrypted + b"\x00" * self._reserve_size
+
+    @staticmethod
+    def _restore_decrypted_pages(
+        path: str,
+        original_size: int,
+        backups: dict[int, bytes],
+    ) -> None:
+        with open(path, "r+b") as output:
+            for offset, original in sorted(backups.items()):
+                output.seek(offset)
+                output.write(original)
+            output.truncate(original_size)
+
+    def _write_decrypted_pages(
+        self,
+        path: str,
+        pages: dict[int, bytes],
+        committed_db_size: int,
+    ) -> tuple[int, dict[int, bytes]]:
+        """覆盖解密页面并返回回滚信息。"""
+        original_size = os.path.getsize(path)
+        backups: dict[int, bytes] = {}
+
+        try:
+            with open(path, "r+b") as output:
+                for page_number, page in sorted(pages.items()):
+                    offset = (page_number - 1) * PAGE_SIZE
+                    if offset not in backups:
+                        output.seek(offset)
+                        backups[offset] = output.read(PAGE_SIZE)
+                    output.seek(offset)
+                    output.write(page)
+
+                # WAL 可能新增页面但未携带 page 1，补齐 SQLite 头中的页数。
+                output.seek(0)
+                page1 = output.read(PAGE_SIZE)
+                if len(page1) != PAGE_SIZE or page1[:16] != SQLITE_HEADER:
+                    raise RuntimeError("WAL 合并后 page 1 无效")
+                current_pages = struct.unpack(">I", page1[28:32])[0]
+                current_size = max(
+                    original_size,
+                    output.seek(0, os.SEEK_END),
+                )
+                file_pages = (current_size + PAGE_SIZE - 1) // PAGE_SIZE
+                max_written = max(pages, default=0)
+                new_pages = max(
+                    current_pages,
+                    committed_db_size,
+                    max_written,
+                    file_pages,
+                )
+                if new_pages != current_pages:
+                    if 0 not in backups:
+                        output.seek(0)
+                        backups[0] = output.read(PAGE_SIZE)
+                    page1 = page1[:28] + struct.pack(">I", new_pages) + page1[32:]
+                    output.seek(0)
+                    output.write(page1)
+                output.flush()
+            return original_size, backups
+        except Exception:
+            if backups:
+                self._restore_decrypted_pages(path, original_size, backups)
+            raise
+
+    def _refresh_from_wal_locked(self) -> None:
+        started = time.perf_counter()
+        wal_signature, wal_data = self._read_wal_snapshot()
+        if self._file_signature(self._db_path) != self._source_signature:
+            self._replace_with_full_snapshot_locked()
+            return
+        pages, frame_count, db_size = self._collect_committed_wal_pages(wal_data)
+        if not pages:
+            self._wal_signature = wal_signature
+            return
+
+        if self._file_signature(self._db_path) != self._source_signature:
+            self._replace_with_full_snapshot_locked()
+            return
+
+        old_conn = self._sqlite_conn
+        if old_conn:
+            old_conn.close()
+        self._sqlite_conn = None
+
+        original_size = 0
+        backups: dict[int, bytes] = {}
+        try:
+            original_size, backups = self._write_decrypted_pages(
+                self._decrypted_path,
+                pages,
+                db_size,
+            )
+            self._sqlite_conn = self._open_decrypted_connection(
+                self._decrypted_path
+            )
+        except Exception:
+            if backups:
+                self._restore_decrypted_pages(
+                    self._decrypted_path,
+                    original_size,
+                    backups,
+                )
+            self._sqlite_conn = self._open_decrypted_connection(
+                self._decrypted_path
+            )
+            raise
+
+        if self._file_signature(self._db_path) != self._source_signature:
+            if self._sqlite_conn:
+                self._sqlite_conn.close()
+            self._restore_decrypted_pages(
+                self._decrypted_path,
+                original_size,
+                backups,
+            )
+            self._sqlite_conn = self._open_decrypted_connection(
+                self._decrypted_path
+            )
+            self._replace_with_full_snapshot_locked()
+            return
+        self._wal_signature = wal_signature
+        self._invalidate_runtime_caches()
+        logger.info(
+            "WAL 增量刷新完成: frames=%d, pages=%d, elapsed=%.3fs",
+            frame_count,
+            len(pages),
+            time.perf_counter() - started,
+        )
 
     def _derive_key(self) -> bool:
         """从原始密钥派生 AES 和 HMAC 密钥。
@@ -1235,20 +1590,24 @@ class WindowsDBReader(BaseDBReader):
         mac_key: bytes,
         reserve_size: int,
         hash_name: str,
+        page_number: int = 1,
     ) -> bool:
+        if len(page) != PAGE_SIZE or page_number <= 0:
+            return False
+        data_start = SALT_SIZE if page_number == 1 else 0
         if hash_name == "sha512":
             digestmod = hashlib.sha512
             stored = page[PAGE_SIZE - reserve_size + IV_SIZE:PAGE_SIZE]
-            data = page[SALT_SIZE:PAGE_SIZE - reserve_size + IV_SIZE]
+            data = page[data_start:PAGE_SIZE - reserve_size + IV_SIZE]
         else:
             digestmod = hashlib.sha1
-            first = page[SALT_SIZE:PAGE_SIZE]
+            first = page[data_start:PAGE_SIZE]
             stored = first[-32:-12]
             data = first[:-32]
 
         calculated = hmac_mod.new(mac_key, data, digestmod)
-        calculated.update(struct.pack("<I", 1))
-        return calculated.digest() == stored
+        calculated.update(struct.pack("<I", page_number))
+        return hmac_mod.compare_digest(calculated.digest(), stored)
 
     def _decrypt_to_temp(self) -> str:
         """将整个加密数据库解密到临时文件。
@@ -1275,22 +1634,9 @@ class WindowsDBReader(BaseDBReader):
                         # 最后一页可能不足 4096 字节，直接写入
                         tmp.write(page_data)
                         continue
-
-                    reserved = page_data[PAGE_SIZE - self._reserve_size:PAGE_SIZE]
-                    iv = reserved[:16]
-                    if page_num == 0:
-                        encrypted = page_data[SALT_SIZE:PAGE_SIZE - self._reserve_size]
-                    else:
-                        encrypted = page_data[:PAGE_SIZE - self._reserve_size]
-
-                    cipher = AES.new(self._aes_key, AES.MODE_CBC, iv=iv)
-                    decrypted = cipher.decrypt(encrypted)
-
-                    if page_num == 0:
-                        decrypted_page = self._rebuild_page1(decrypted)
-                    else:
-                        decrypted_page = decrypted + b"\x00" * self._reserve_size
-                    tmp.write(decrypted_page)
+                    tmp.write(
+                        self._decrypt_encrypted_page(page_data, page_num + 1)
+                    )
 
                     if page_num % 1000 == 0 and page_num > 0:
                         logger.debug(

@@ -1,12 +1,21 @@
+import hashlib
+import hmac
 import os
 import sqlite3
+import struct
 import sys
 
 import pytest
+from Crypto.Cipher import AES
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from app.core.db_reader_windows import WindowsDBReader
+from app.core.db_reader_windows import (
+    PAGE_SIZE,
+    WAL_FRAME_SIZE,
+    WAL_HEADER_SIZE,
+    WindowsDBReader,
+)
 from app.core.wechat_paths_windows import WeChatDataDir, find_wechat_data_dirs
 from diagnose_weixin_windows import _find_message_key, _is_message_db_rel_path
 
@@ -326,5 +335,104 @@ def test_windows_v4_conflicting_evidence_fails_closed(monkeypatch):
     monkeypatch.setattr(reader, "get_current_wxid", lambda: "unknown_account")
 
     assert reader._get_current_sender_id() is None
+
+    reader.close()
+
+
+def _build_encrypted_wal_page(
+    reader: WindowsDBReader,
+    page_number: int,
+    marker: int,
+) -> tuple[bytes, bytes]:
+    plaintext = bytes([marker]) + b"\x00" * (
+        PAGE_SIZE - reader._reserve_size - 1
+    )
+    iv = bytes(range(16))
+    encrypted = AES.new(reader._aes_key, AES.MODE_CBC, iv=iv).encrypt(
+        plaintext
+    )
+    authenticated = encrypted + iv
+    digest = hmac.new(reader._hmac_key, authenticated, hashlib.sha512)
+    digest.update(struct.pack("<I", page_number))
+    return authenticated + digest.digest(), plaintext + b"\x00" * 80
+
+
+def test_windows_wal_merge_uses_current_salt_and_last_committed_frame():
+    """预分配 WAL 中旧世代和未提交尾帧都不能覆盖最新已提交消息。"""
+    reader = WindowsDBReader()
+    reader._aes_key = bytes(range(32))
+    reader._hmac_key = bytes(range(32, 64))
+    reader._reserve_size = 80
+    reader._hmac_hash = "sha512"
+
+    old_salt = b"old-salt"
+    current_salt = b"new-salt"
+    old_page, _ = _build_encrypted_wal_page(reader, 2, 5)
+    committed_page, committed_plain = _build_encrypted_wal_page(reader, 2, 13)
+    uncommitted_page, _ = _build_encrypted_wal_page(reader, 2, 10)
+
+    header = struct.pack(">III", 0x377F0682, 3007000, PAGE_SIZE)
+    header += b"\x00" * 4 + current_salt + b"\x00" * 8
+    frames = [
+        struct.pack(">II", 2, 2) + old_salt + b"\x00" * 8 + old_page,
+        struct.pack(">II", 2, 2) + current_salt + b"\x00" * 8 + committed_page,
+        struct.pack(">II", 2, 0) + current_salt + b"\x00" * 8 + uncommitted_page,
+    ]
+    wal_data = header + b"".join(frames)
+
+    pages, frame_count, db_size = reader._collect_committed_wal_pages(wal_data)
+
+    assert len(wal_data) == WAL_HEADER_SIZE + 3 * WAL_FRAME_SIZE
+    assert pages == {2: committed_plain}
+    assert frame_count == 1
+    assert db_size == 2
+
+
+def test_windows_wal_hmac_is_bound_to_actual_page_number():
+    reader = WindowsDBReader()
+    reader._aes_key = bytes(range(32))
+    reader._hmac_key = bytes(range(32, 64))
+    page, _ = _build_encrypted_wal_page(reader, 7, 13)
+
+    assert reader._verify_page_hmac(
+        page,
+        reader._hmac_key,
+        80,
+        "sha512",
+        page_number=7,
+    ) is True
+    assert reader._verify_page_hmac(
+        page,
+        reader._hmac_key,
+        80,
+        "sha512",
+        page_number=1,
+    ) is False
+
+
+def test_windows_reuses_empty_query_until_snapshot_changes(monkeypatch):
+    """同一数据库快照不应每 0.5 秒重复扫描全部会话表。"""
+    reader = WindowsDBReader()
+    reader._sqlite_conn = sqlite3.connect(":memory:")
+    reader._sqlite_conn.row_factory = sqlite3.Row
+    reader._sqlite_conn.execute("CREATE TABLE Msg_test (local_id INTEGER)")
+    reader._last_refresh = float("inf")
+    reader._source_signature = (4096, 1)
+    reader._wal_signature = (4120, 2)
+    calls = []
+
+    def fake_query(timestamp):
+        calls.append(timestamp)
+        return []
+
+    monkeypatch.setattr(reader, "_query_v4_messages_since", fake_query)
+
+    assert reader.query_messages_since(123) == []
+    assert reader.query_messages_since(123) == []
+    assert calls == [123]
+
+    reader._wal_signature = (8240, 3)
+    assert reader.query_messages_since(123) == []
+    assert calls == [123, 123]
 
     reader.close()
