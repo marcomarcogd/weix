@@ -584,6 +584,48 @@ def test_group_reply_rule_config_keeps_custom_reply_and_requires_whitelist():
         _normalize_group_reply_rules(rules, [])
 
 
+def test_group_whitelist_removal_prunes_only_removed_room_rules():
+    from fastapi import HTTPException
+    from app.api.config import (
+        _normalize_group_reply_rules,
+        _prune_rules_for_removed_rooms,
+    )
+
+    rules = [
+        {
+            "room_id": "removed@chatroom",
+            "keyword": "@所有人",
+            "reply": "1",
+            "enabled": True,
+        },
+        {
+            "room_id": "kept@chatroom",
+            "keyword": "通知",
+            "reply": "收到",
+            "enabled": True,
+        },
+        {
+            "room_id": "never-allowed@chatroom",
+            "keyword": "测试",
+            "reply": "不应静默放行",
+            "enabled": True,
+        },
+    ]
+
+    pruned = _prune_rules_for_removed_rooms(
+        rules,
+        ["removed@chatroom", "kept@chatroom"],
+        ["kept@chatroom"],
+    )
+
+    assert [rule["room_id"] for rule in pruned] == [
+        "kept@chatroom",
+        "never-allowed@chatroom",
+    ]
+    with pytest.raises(HTTPException):
+        _normalize_group_reply_rules(pruned, ["kept@chatroom"])
+
+
 def test_group_reply_rule_config_rejects_duplicate_enabled_room():
     from fastapi import HTTPException
     from app.api.config import _normalize_group_reply_rules

@@ -91,6 +91,38 @@ def _normalize_group_reply_rules(
     return normalized
 
 
+def _prune_rules_for_removed_rooms(
+    value,
+    previous_whitelist,
+    next_whitelist,
+):
+    """移除本次退出群聊白名单的群所关联的专属规则。"""
+    if not all(
+        isinstance(item, list)
+        for item in (value, previous_whitelist, next_whitelist)
+    ):
+        return value
+
+    previous_rooms = {
+        str(room).strip() for room in previous_whitelist if str(room).strip()
+    }
+    next_rooms = {
+        str(room).strip() for room in next_whitelist if str(room).strip()
+    }
+    removed_rooms = previous_rooms - next_rooms
+    if not removed_rooms:
+        return value
+
+    return [
+        item
+        for item in value
+        if not (
+            isinstance(item, dict)
+            and str(item.get("room_id", "")).strip() in removed_rooms
+        )
+    ]
+
+
 # --- Chat Config ---
 @router.get("/config/chat")
 async def get_chat_config():
@@ -106,11 +138,18 @@ async def update_chat_config(data: dict):
             "group_whitelist",
             cfg.auto_reply.get("group_whitelist", []),
         )
+        effective_rules = normalized_data.get(
+            "group_reply_rules",
+            cfg.auto_reply.get("group_reply_rules", []),
+        )
+        if "group_whitelist" in normalized_data:
+            effective_rules = _prune_rules_for_removed_rooms(
+                effective_rules,
+                cfg.auto_reply.get("group_whitelist", []),
+                effective_whitelist,
+            )
         normalized_data["group_reply_rules"] = _normalize_group_reply_rules(
-            normalized_data.get(
-                "group_reply_rules",
-                cfg.auto_reply.get("group_reply_rules", []),
-            ),
+            effective_rules,
             effective_whitelist,
         )
 

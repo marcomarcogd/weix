@@ -90,6 +90,7 @@ const form = reactive<any>({
   enabled: false,
   group_chat_mode: 'whitelist',
   group_whitelist: [],
+  group_reply_rules: [],
   private_chat_mode: 'whitelist',
   private_whitelist: [],
   reply_mode: 'all',
@@ -175,6 +176,12 @@ function addRoom(roomId: string) {
 
 function removeRoom(room: string) {
   form.group_whitelist = form.group_whitelist.filter((r: string) => r !== room)
+  const rules = Array.isArray(form.group_reply_rules) ? form.group_reply_rules : []
+  const remainingRules = rules.filter((rule: any) => rule?.room_id !== room)
+  if (remainingRules.length !== rules.length) {
+    form.group_reply_rules = remainingRules
+    ElMessage.info('已同步移除该群的群聊专属规则，保存后生效')
+  }
 }
 
 function addUser(wxid: string) {
