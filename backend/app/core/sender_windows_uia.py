@@ -35,6 +35,14 @@ SEND_NAMES = {"发送", "发送(S)", "Send"}
 _UIA_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wx-uia")
 
 
+class UIAWindowError(RuntimeError):
+    """带可诊断原因码的微信窗口/UIA 锚定错误。"""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 def _safe_attr(control: Any, name: str, default: Any = "") -> Any:
     try:
         value = getattr(control, name, default)
@@ -66,22 +74,75 @@ class DirectUIAAdapter:
         self.auto = auto
 
     def main_window(self, pid: int, *, activate: bool = False) -> Any:
-        root = self.auto.GetRootControl()
-        matches = []
-        for control in root.GetChildren():
-            class_name = str(_safe_attr(control, "ClassName", "") or "")
-            name = str(_safe_attr(control, "Name", "") or "").strip()
-            process_id = int(_safe_attr(control, "ProcessId", 0) or 0)
-            if class_name != MAIN_CLASS or name not in MAIN_NAMES or process_id != int(pid):
-                continue
-            matches.append(control)
-        if len(matches) != 1:
-            raise RuntimeError(
-                "未找到唯一的已绑定微信 UIA 主窗口"
-                if not matches
-                else "已绑定微信进程暴露了多个 UIA 主窗口"
+        """通过已绑定 PID 的 Win32 句柄锚定 UIA，不扫描 UIA Root。"""
+        try:
+            import win32gui
+            import win32process
+        except ImportError as exc:
+            raise UIAWindowError("win32_unavailable", "Windows 窗口组件不可用") from exc
+
+        candidates: list[tuple[int, int]] = []
+
+        def enum_handler(hwnd, _extra):
+            try:
+                _thread_id, owner_pid = win32process.GetWindowThreadProcessId(hwnd)
+                if int(owner_pid or 0) != int(pid):
+                    return True
+                title = str(win32gui.GetWindowText(hwnd) or "").strip()
+                if title not in MAIN_NAMES or not win32gui.IsWindowVisible(hwnd):
+                    return True
+                left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+                width = max(0, int(right) - int(left))
+                height = max(0, int(bottom) - int(top))
+                if width < 400 or height < 300:
+                    return True
+                candidates.append((width * height, int(hwnd)))
+            except Exception:
+                pass
+            return True
+
+        try:
+            win32gui.EnumWindows(enum_handler, None)
+        except Exception as exc:
+            raise UIAWindowError(
+                "window_enumeration_failed",
+                f"枚举微信窗口失败: {exc}",
+            ) from exc
+
+        candidates.sort(reverse=True)
+        handles = [hwnd for _area, hwnd in candidates]
+        if not handles:
+            raise UIAWindowError(
+                "window_not_found",
+                "未找到绑定 PID 对应的可见微信主窗口；请打开微信聊天主窗口",
             )
-        window = matches[0]
+        if len(handles) != 1:
+            raise UIAWindowError(
+                "ambiguous_window",
+                "绑定 PID 对应多个可见微信主窗口，已拒绝选择任意窗口",
+            )
+
+        hwnd = handles[0]
+        try:
+            window = self.auto.ControlFromHandle(hwnd)
+        except Exception as exc:
+            raise UIAWindowError(
+                "uia_tree_unavailable",
+                "微信窗口已找到，但无法通过窗口句柄读取 UIA 树",
+            ) from exc
+        class_name = str(_safe_attr(window, "ClassName", "") or "")
+        process_id = int(_safe_attr(window, "ProcessId", 0) or 0)
+        native_hwnd = int(_safe_attr(window, "NativeWindowHandle", 0) or 0)
+        if process_id != int(pid) or native_hwnd != int(hwnd):
+            raise UIAWindowError(
+                "uia_identity_mismatch",
+                "UIA 控件所属 PID 或窗口句柄与已绑定微信不一致",
+            )
+        if class_name != MAIN_CLASS:
+            raise UIAWindowError(
+                "uia_tree_unavailable",
+                f"微信窗口已找到，但 UIA 树尚未物化（当前类名: {class_name or '-'}）",
+            )
         if activate:
             self.activate(window, pid)
         return window
@@ -474,6 +535,7 @@ class WindowsUIASender:
             "chat_input": False,
             "send_button": False,
             "reason": reason,
+            "reason_code": "account_binding_unavailable" if reason else "",
             "narrator_hint": False,
         }
         if not valid:
@@ -511,12 +573,20 @@ class WindowsUIASender:
             )
             if result["available"]:
                 result["reason"] = "UIA 关键控件已就绪"
+                result["reason_code"] = ""
             else:
                 result["reason"] = "微信 UIA 树缺少关键控件"
+                result["reason_code"] = "uia_controls_missing"
                 result["narrator_hint"] = True
+        except UIAWindowError as exc:
+            result["reason"] = str(exc)
+            result["reason_code"] = exc.code
+            result["narrator_hint"] = exc.code == "uia_tree_unavailable"
+            if exc.code == "window_not_found":
+                result["help"] = "请打开完整的微信聊天主窗口并保持可见，然后重新检测。"
         except Exception as exc:
             result["reason"] = str(exc)
-            result["narrator_hint"] = True
+            result["reason_code"] = "uia_diagnose_failed"
         return result
 
     async def send_text_result(
@@ -636,6 +706,8 @@ class WindowsUIASender:
                     break
                 time.sleep(0.1)
             return result.pending("db_verify", "awaiting_db_confirmation", "等待消息数据库确认")
+        except UIAWindowError as exc:
+            return result.fail("window", exc.code, str(exc))
         except Exception as exc:
             return result.fail("window", "uia_pre_send_failed", str(exc))
 

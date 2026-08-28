@@ -457,14 +457,14 @@ class WindowsSender(BaseMessageSender):
         def enum_handler(hwnd, _):
             title = (win32gui.GetWindowText(hwnd) or "").strip()
             if title not in WECHAT_WINDOW_TITLES:
-                return
+                return True
             try:
                 _thread_id, pid = win32process.GetWindowThreadProcessId(hwnd)
                 proc_name = psutil.Process(pid).name().lower()
             except Exception:
-                return
+                return True
             if proc_name not in WECHAT_PROCESS_NAMES:
-                return
+                return True
             left, top, right, bottom = win32gui.GetWindowRect(hwnd)
             width = right - left
             height = bottom - top
@@ -473,7 +473,7 @@ class WindowsSender(BaseMessageSender):
             # 两者都是有效微信主窗口，真正发送前会自动恢复。
             is_minimized = bool(win32gui.IsIconic(hwnd))
             if not is_minimized and (width < 400 or height < 300):
-                return
+                return True
             matches.append(
                 _WindowRef(
                     left=left,
@@ -484,6 +484,7 @@ class WindowsSender(BaseMessageSender):
                     hwnd=hwnd,
                 )
             )
+            return True
 
         try:
             win32gui.EnumWindows(enum_handler, None)

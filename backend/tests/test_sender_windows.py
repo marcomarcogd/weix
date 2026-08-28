@@ -563,6 +563,106 @@ def test_uia_missing_or_mismatched_account_binding_fails_closed():
     assert adapter.search_calls == 0
 
 
+def test_direct_uia_main_window_anchors_from_bound_pid_handle():
+    """不能依赖 UIA Root；应从 Win32 唯一句柄直接锚定 UIA。"""
+    from app.core.sender_windows_uia import DirectUIAAdapter
+
+    window = SimpleNamespace(
+        ClassName="mmui::MainWindow",
+        Name="当前聊天标题",
+        ProcessId=4321,
+        NativeWindowHandle=123,
+    )
+    auto = SimpleNamespace(ControlFromHandle=MagicMock(return_value=window))
+    adapter = object.__new__(DirectUIAAdapter)
+    adapter.auto = auto
+
+    def enum_windows(callback, extra):
+        assert callback(123, extra) is True
+        assert callback(456, extra) is True
+
+    with (
+        patch("win32gui.EnumWindows", side_effect=enum_windows),
+        patch(
+            "win32process.GetWindowThreadProcessId",
+            side_effect=lambda hwnd: (1, 4321 if hwnd == 123 else 9999),
+        ),
+        patch("win32gui.GetWindowText", return_value="微信"),
+        patch("win32gui.IsWindowVisible", return_value=True),
+        patch("win32gui.GetWindowRect", return_value=(0, 0, 1200, 800)),
+    ):
+        result = adapter.main_window(4321, activate=False)
+
+    assert result is window
+    auto.ControlFromHandle.assert_called_once_with(123)
+
+
+def test_direct_uia_main_window_rejects_wrong_pid_before_uia_access():
+    from app.core.sender_windows_uia import DirectUIAAdapter, UIAWindowError
+
+    auto = SimpleNamespace(ControlFromHandle=MagicMock())
+    adapter = object.__new__(DirectUIAAdapter)
+    adapter.auto = auto
+
+    def enum_windows(callback, extra):
+        callback(123, extra)
+
+    with (
+        patch("win32gui.EnumWindows", side_effect=enum_windows),
+        patch("win32process.GetWindowThreadProcessId", return_value=(1, 9999)),
+    ):
+        with pytest.raises(UIAWindowError) as captured:
+            adapter.main_window(4321)
+
+    assert captured.value.code == "window_not_found"
+    auto.ControlFromHandle.assert_not_called()
+
+
+def test_direct_uia_main_window_reports_unmaterialized_tree():
+    from app.core.sender_windows_uia import DirectUIAAdapter, UIAWindowError
+
+    shell = SimpleNamespace(
+        ClassName="Qt5152QWindowIcon",
+        Name="微信",
+        ProcessId=4321,
+        NativeWindowHandle=123,
+    )
+    adapter = object.__new__(DirectUIAAdapter)
+    adapter.auto = SimpleNamespace(ControlFromHandle=MagicMock(return_value=shell))
+
+    with (
+        patch("win32gui.EnumWindows", side_effect=lambda callback, extra: callback(123, extra)),
+        patch("win32process.GetWindowThreadProcessId", return_value=(1, 4321)),
+        patch("win32gui.GetWindowText", return_value="微信"),
+        patch("win32gui.IsWindowVisible", return_value=True),
+        patch("win32gui.GetWindowRect", return_value=(0, 0, 1200, 800)),
+    ):
+        with pytest.raises(UIAWindowError) as captured:
+            adapter.main_window(4321)
+
+    assert captured.value.code == "uia_tree_unavailable"
+
+
+def test_uia_diagnosis_distinguishes_missing_visible_window():
+    from app.core.sender_windows_uia import UIAWindowError, WindowsUIASender
+
+    adapter = MagicMock()
+    adapter.main_window.side_effect = UIAWindowError(
+        "window_not_found",
+        "请打开微信聊天主窗口",
+    )
+    sender = WindowsUIASender(
+        adapter_factory=lambda: adapter,
+        binding_provider=_uia_binding,
+    )
+
+    diagnosis = sender._diagnose_sync()
+
+    assert diagnosis["reason_code"] == "window_not_found"
+    assert diagnosis["narrator_hint"] is False
+    assert "打开" in diagnosis["help"]
+
+
 class FakeControl:
     def __init__(self, *, name="", aid="", children=None):
         self.Name = name
@@ -643,8 +743,10 @@ def test_find_wechat_window_accepts_hidden_tray_main_window():
     process = MagicMock()
     process.name.return_value = "Weixin.exe"
 
+    callback_results = []
+
     def enum_windows(callback, extra):
-        callback(123, extra)
+        callback_results.append(callback(123, extra))
 
     with (
         patch("win32gui.EnumWindows", side_effect=enum_windows),
@@ -660,6 +762,7 @@ def test_find_wechat_window_accepts_hidden_tray_main_window():
     assert window is not None
     assert window.hwnd == 123
     assert window.title == "微信"
+    assert callback_results == [True]
 
 
 def test_find_wechat_window_rejects_small_non_minimized_window():
