@@ -112,6 +112,7 @@ $ForbiddenInputs = @(
     (Join-Path $ProjectDir "config\config.yaml")
     (Join-Path $ProjectDir ".env")
     (Join-Path $ProjectDir "data\all_keys.json")
+    (Join-Path $ProjectDir "data\windows_sender_calibration.json")
 )
 foreach ($ForbiddenInput in $ForbiddenInputs) {
     if ($PyInstallerArgs -contains $ForbiddenInput) {
@@ -131,7 +132,7 @@ $ConflictingIcu = $ArchiveEntries | Where-Object {
 if ($ConflictingIcu) {
     throw "构建产物包含应用根目录 ICU DLL，可能导致 QtCore 无法加载"
 }
-$SensitiveArchivePattern = "config[\\/]config\.yaml|all_keys\.json|[\\/']\.env(?:[\\/']|$)|manager\.log|backend\.log|frontend\.log"
+$SensitiveArchivePattern = "config[\\/]config\.yaml|all_keys\.json|windows_sender_calibration\.json|[\\/']\.env(?:[\\/']|$)|manager\.log|backend\.log|frontend\.log"
 if ($ArchiveEntries -match $SensitiveArchivePattern) {
     throw "构建产物意外包含配置、密钥或日志文件"
 }

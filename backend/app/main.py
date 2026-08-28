@@ -4,6 +4,10 @@ import logging
 import sys
 import threading
 
+from app.core.windows_sender_calibration import enable_per_monitor_dpi_awareness
+
+enable_per_monitor_dpi_awareness()
+
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

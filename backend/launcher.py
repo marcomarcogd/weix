@@ -19,13 +19,34 @@ import webbrowser
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import psutil
-from PyQt6.QtCore import QObject, QLockFile, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QCloseEvent, QFont, QTextCursor
+import yaml
+from PyQt6.QtCore import QObject, QRectF, QLockFile, QTimer, Qt, pyqtSignal
+from PyQt6.QtGui import (
+    QAction,
+    QBrush,
+    QCloseEvent,
+    QColor,
+    QFont,
+    QImage,
+    QPainter,
+    QPen,
+    QPixmap,
+    QTextCursor,
+)
 from PyQt6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDialogButtonBox,
+    QGraphicsEllipseItem,
+    QGraphicsItem,
+    QGraphicsPixmapItem,
+    QGraphicsScene,
+    QGraphicsSimpleTextItem,
+    QGraphicsView,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -38,6 +59,21 @@ from PyQt6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QWidget,
+)
+
+from app.core.windows_sender_calibration import (
+    CALIBRATION_FILENAME,
+    POINT_DEFINITIONS,
+    ClientGeometry,
+    calibration_is_compatible,
+    default_calibration,
+    find_wechat_main_window,
+    get_client_geometry,
+    get_process_file_version,
+    load_calibration,
+    point_to_profile_value,
+    resolve_point,
+    save_calibration,
 )
 
 
@@ -128,6 +164,266 @@ class RotatingLogSink:
                 source.replace(target)
         if self.path.exists():
             self.path.replace(self.path.with_name(f"{self.path.name}.1"))
+
+
+MAIN_CALIBRATION_POINTS = (
+    "search_input",
+    "search_clear",
+    "private_search_result",
+    "group_search_result",
+    "message_input",
+    "send_button",
+)
+
+
+class CalibrationMarker(QGraphicsEllipseItem):
+    """可在只读截图上拖动的校准标记，不产生系统鼠标事件。"""
+
+    def __init__(self, label: str, color: QColor):
+        super().__init__(-8, -8, 16, 16)
+        self.setBrush(QBrush(color))
+        self.setPen(QPen(QColor("#ffffff"), 2))
+        self.setZValue(10)
+        self.setFlags(
+            QGraphicsItem.GraphicsItemFlag.ItemIsMovable
+            | QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
+        )
+        text = QGraphicsSimpleTextItem(label, self)
+        text.setBrush(QBrush(QColor("#ffeb3b")))
+        text.setPos(11, -12)
+        text.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+
+
+class CalibrationCanvas(QGraphicsView):
+    def __init__(self, pixmap: QPixmap, points: dict[str, tuple[float, float]]):
+        super().__init__()
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._scene.addItem(QGraphicsPixmapItem(pixmap))
+        self._scene.setSceneRect(QRectF(pixmap.rect()))
+        self._markers: dict[str, CalibrationMarker] = {}
+        colors = (
+            QColor("#e53935"),
+            QColor("#fb8c00"),
+            QColor("#8e24aa"),
+            QColor("#3949ab"),
+            QColor("#00897b"),
+            QColor("#43a047"),
+            QColor("#d81b60"),
+        )
+        for index, (name, position) in enumerate(points.items()):
+            marker = CalibrationMarker(
+                str(POINT_DEFINITIONS[name]["label"]),
+                colors[index % len(colors)],
+            )
+            marker.setPos(float(position[0]), float(position[1]))
+            self._scene.addItem(marker)
+            self._markers[name] = marker
+        self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setMinimumHeight(360)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+    def point(self, name: str) -> tuple[float, float]:
+        position = self._markers[name].scenePos()
+        return float(position.x()), float(position.y())
+
+
+def _seed_calibration_from_config(
+    project_root: Path,
+    wechat_version: str,
+) -> dict[str, Any]:
+    existing = load_calibration(project_root / "data" / CALIBRATION_FILENAME)
+    compatible, _reason = calibration_is_compatible(existing, wechat_version)
+    if compatible and existing is not None:
+        return existing
+
+    profile = default_calibration(wechat_version, confirmed=False)
+    config_path = project_root / "config" / "config.yaml"
+    try:
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        win_cfg = raw.get("windows_sender", {})
+        if not isinstance(win_cfg, dict):
+            return profile
+        mappings = {
+            "search_input": ("search_x_offset", "search_y_offset"),
+            "search_clear": ("search_clear_x_offset", "search_clear_y_offset"),
+            "private_search_result": (
+                "search_result_x_offset",
+                "search_result_y_offset",
+            ),
+            "group_search_result": (
+                "group_search_result_x_offset",
+                "group_search_result_y_offset",
+            ),
+            "send_button": (
+                "send_button_x_from_right",
+                "send_button_y_from_bottom",
+            ),
+            "paste_menu": ("paste_menu_x_offset", "paste_menu_y_offset"),
+        }
+        for point_name, keys in mappings.items():
+            point = profile["points"][point_name]
+            if keys[0] in win_cfg:
+                point["x"] = float(win_cfg[keys[0]])
+            if keys[1] in win_cfg:
+                point["y"] = float(win_cfg[keys[1]])
+        message_point = profile["points"]["message_input"]
+        if "click_x_ratio" in win_cfg:
+            message_point["x"] = float(win_cfg["click_x_ratio"])
+        if "click_y_ratio" in win_cfg:
+            message_point["y"] = float(win_cfg["click_y_ratio"])
+    except Exception:
+        pass
+    return profile
+
+
+def _capture_client_pixmap(geometry: ClientGeometry) -> QPixmap:
+    """仅把当前屏幕中的微信客户区截到内存，不写入任何图片文件。"""
+    from PIL import ImageGrab
+
+    image = ImageGrab.grab(
+        bbox=(
+            geometry.left,
+            geometry.top,
+            geometry.left + geometry.width,
+            geometry.top + geometry.height,
+        ),
+        all_screens=True,
+    ).convert("RGBA")
+    if image.size != (geometry.width, geometry.height):
+        image = image.resize((geometry.width, geometry.height))
+    raw = image.tobytes("raw", "RGBA")
+    qimage = QImage(
+        raw,
+        geometry.width,
+        geometry.height,
+        geometry.width * 4,
+        QImage.Format.Format_RGBA8888,
+    ).copy()
+    return QPixmap.fromImage(qimage)
+
+
+def _menu_preview_pixmap() -> QPixmap:
+    pixmap = QPixmap(240, 150)
+    pixmap.fill(QColor("#f5f5f5"))
+    painter = QPainter(pixmap)
+    painter.setPen(QPen(QColor("#777777"), 1))
+    painter.drawRect(1, 1, 237, 147)
+    painter.setPen(QColor("#333333"))
+    painter.setFont(QFont("Microsoft YaHei", 10))
+    painter.drawText(14, 28, "粘贴")
+    painter.drawLine(8, 38, 230, 38)
+    painter.drawText(14, 66, "其它菜单项（示意）")
+    painter.end()
+    return pixmap
+
+
+class CalibrationDialog(QDialog):
+    def __init__(
+        self,
+        project_root: Path,
+        screenshot: QPixmap,
+        geometry: ClientGeometry,
+        wechat_version: str,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._project_root = project_root
+        self._geometry = geometry
+        self._wechat_version = wechat_version
+        self.saved_path: Optional[Path] = None
+        self.setWindowTitle("微信点击校准（只读预览）")
+        self.resize(1080, 820)
+
+        seed = _seed_calibration_from_config(project_root, wechat_version)
+        fallback_seed = default_calibration(wechat_version, confirmed=False)
+        positions: dict[str, tuple[float, float]] = {}
+        for name in MAIN_CALIBRATION_POINTS:
+            try:
+                screen_x, screen_y = resolve_point(seed, name, geometry)
+            except Exception:
+                screen_x, screen_y = resolve_point(fallback_seed, name, geometry)
+            positions[name] = (
+                float(screen_x - geometry.left),
+                float(screen_y - geometry.top),
+            )
+        paste_seed = seed["points"]["paste_menu"]
+
+        layout = QVBoxLayout(self)
+        instruction = QLabel(
+            "请确认预览确实是微信，并把圆点拖到对应控件中央。"
+            "截图只保存在内存中，不会写入磁盘；保存的文件只有坐标和微信版本。"
+        )
+        instruction.setWordWrap(True)
+        layout.addWidget(instruction)
+
+        self._main_canvas = CalibrationCanvas(screenshot, positions)
+        layout.addWidget(self._main_canvas, stretch=1)
+
+        menu_group = QGroupBox(
+            "右键菜单相对位置（运行时还会验证菜单属于同一个 Weixin 进程）"
+        )
+        menu_layout = QVBoxLayout(menu_group)
+        self._menu_canvas = CalibrationCanvas(
+            _menu_preview_pixmap(),
+            {
+                "paste_menu": (
+                    float(paste_seed.get("x", 24.0)),
+                    float(paste_seed.get("y", 15.0)),
+                )
+            },
+        )
+        self._menu_canvas.setMaximumHeight(190)
+        menu_layout.addWidget(self._menu_canvas)
+        layout.addWidget(menu_group)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("确认并保存")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _save(self) -> None:
+        try:
+            profile = default_calibration(self._wechat_version, confirmed=True)
+            for name in MAIN_CALIBRATION_POINTS:
+                relative_x, relative_y = self._main_canvas.point(name)
+                if not (
+                    0 < relative_x < self._geometry.width
+                    and 0 < relative_y < self._geometry.height
+                ):
+                    raise RuntimeError(f"{POINT_DEFINITIONS[name]['label']}超出预览范围")
+                profile["points"][name] = point_to_profile_value(
+                    name,
+                    relative_x,
+                    relative_y,
+                    self._geometry,
+                )
+                resolve_point(profile, name, self._geometry)
+
+            paste_x, paste_y = self._menu_canvas.point("paste_menu")
+            if not (0 < paste_x < 240 and 0 < paste_y < 150):
+                raise RuntimeError("粘贴菜单项超出菜单预览范围")
+            profile["points"]["paste_menu"] = {
+                "anchor": "top_left",
+                "x": round(paste_x, 3),
+                "y": round(paste_y, 3),
+            }
+            self.saved_path = save_calibration(
+                profile,
+                self._project_root / "data" / CALIBRATION_FILENAME,
+            )
+            self.accept()
+        except Exception as exc:
+            QMessageBox.critical(self, "校准未保存", str(exc))
 
 
 def discover_project_root() -> Path:
@@ -524,6 +820,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._signals = signals
         self._instance_lock = instance_lock
+        self._project_root = project_root
         self._controller = ServiceController(project_root, signals)
         self._state = ServiceState.STOPPED
         self._restart_pending = False
@@ -574,12 +871,14 @@ class MainWindow(QMainWindow):
         self._btn_stop = QPushButton("停止")
         self._btn_restart = QPushButton("重启")
         self._btn_browser = QPushButton("打开网页")
+        self._btn_calibrate = QPushButton("微信点击校准")
         self._btn_clear_view = QPushButton("清空显示")
         self._btn_clear_files = QPushButton("清理日志文件")
         self._btn_start.clicked.connect(self._begin_start)
         self._btn_stop.clicked.connect(self._begin_stop)
         self._btn_restart.clicked.connect(self._begin_restart)
         self._btn_browser.clicked.connect(self._open_browser)
+        self._btn_calibrate.clicked.connect(self._begin_calibration)
         self._btn_clear_view.clicked.connect(self._clear_log_view)
         self._btn_clear_files.clicked.connect(self._clear_log_files)
         for button in (
@@ -587,6 +886,7 @@ class MainWindow(QMainWindow):
             self._btn_stop,
             self._btn_restart,
             self._btn_browser,
+            self._btn_calibrate,
             self._btn_clear_view,
             self._btn_clear_files,
         ):
@@ -667,6 +967,9 @@ class MainWindow(QMainWindow):
         self._btn_stop.setEnabled(stop_enabled)
         self._btn_restart.setEnabled(restart_enabled)
         self._btn_browser.setEnabled(browser_enabled)
+        self._btn_calibrate.setEnabled(
+            state == ServiceState.STOPPED and not any_process_running
+        )
         self._tray_start.setEnabled(start_enabled)
         self._tray_stop.setEnabled(stop_enabled)
         self._tray_restart.setEnabled(restart_enabled)
@@ -800,6 +1103,82 @@ class MainWindow(QMainWindow):
             self._controller.log("manager", "日志文件已清理")
         except Exception as exc:
             QMessageBox.critical(self, "清理失败", str(exc))
+
+    def _begin_calibration(self) -> None:
+        """隐藏管理器后只读截取微信客户区，不激活、不点击微信。"""
+        if self._state != ServiceState.STOPPED or self._controller.any_process_running():
+            QMessageBox.warning(self, "无法校准", "请先停止 Weix 前后端服务。")
+            return
+        if port_is_listening(BACKEND_PORT):
+            pid = listening_pid(BACKEND_PORT)
+            QMessageBox.warning(
+                self,
+                "无法校准",
+                "检测到后端仍在运行"
+                + (f"（PID {pid}）" if pid else "")
+                + "，请先停止后再校准。",
+            )
+            return
+        hwnd = find_wechat_main_window(visible_only=True)
+        if not hwnd:
+            QMessageBox.warning(
+                self,
+                "未找到可见微信",
+                "请手动打开微信主窗口并恢复到正常大小，然后重新点击校准。",
+            )
+            return
+        version = get_process_file_version(hwnd)
+        if not version:
+            QMessageBox.warning(
+                self,
+                "无法确认微信版本",
+                "读取微信程序版本失败。为避免坐标过期，本次不允许保存校准。",
+            )
+            return
+        try:
+            geometry = get_client_geometry(hwnd)
+        except Exception as exc:
+            QMessageBox.warning(self, "微信窗口不可校准", str(exc))
+            return
+
+        QMessageBox.information(
+            self,
+            "准备只读截图",
+            "请确保微信窗口没有被其他程序遮挡。管理器将暂时隐藏并只截取屏幕中的"
+            "微信客户区，不会激活、点击或发送任何内容。",
+        )
+        self.hide()
+
+        def capture() -> None:
+            try:
+                screenshot = _capture_client_pixmap(geometry)
+            except Exception as exc:
+                self.showNormal()
+                self.raise_()
+                QMessageBox.critical(self, "截取失败", str(exc))
+                return
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+            dialog = CalibrationDialog(
+                self._project_root,
+                screenshot,
+                geometry,
+                version,
+                self,
+            )
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self._controller.log(
+                    "manager",
+                    f"微信点击校准已保存：{dialog.saved_path}",
+                )
+                QMessageBox.information(
+                    self,
+                    "校准完成",
+                    "坐标已保存。现在可以启动服务；微信版本变化后需要重新校准。",
+                )
+
+        QTimer.singleShot(400, capture)
 
     @staticmethod
     def _open_browser() -> None:

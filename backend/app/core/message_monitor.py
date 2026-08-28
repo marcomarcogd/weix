@@ -8,6 +8,8 @@
 
 import asyncio
 import logging
+import re
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -45,6 +47,36 @@ class MonitorConfig:
     retry_delay: float = 5.0  # 错误重试延迟 (秒)
     queue_maxsize: int = 10000  # 消息队列最大容量
     sent_message_ttl: float = 300.0  # 机器人已发送消息去重窗口 (秒)
+
+
+@dataclass
+class _PendingSendConfirmation:
+    confirmation_id: int
+    target_id: str
+    normalized_content: str
+    since_ts: int
+    until_ts: int
+    event: threading.Event = field(default_factory=threading.Event)
+    matched: bool = False
+
+
+class SendConfirmationHandle:
+    """供 GUI 发送线程等待监听器回读结果的线程安全句柄。"""
+
+    def __init__(
+        self,
+        monitor: "MessageMonitor",
+        pending: _PendingSendConfirmation,
+    ):
+        self._monitor = monitor
+        self._pending = pending
+
+    def wait(self, timeout: float) -> bool:
+        self._pending.event.wait(timeout=max(float(timeout), 0.0))
+        return bool(self._pending.matched)
+
+    def cancel(self) -> None:
+        self._monitor._cancel_send_confirmation(self._pending.confirmation_id)
 
 
 class MessageMonitor:
@@ -98,6 +130,9 @@ class MessageMonitor:
         self._stop_event: Optional[asyncio.Event] = None
         self._stats = MonitorStats()
         self._sent_messages: list[tuple[str, str, float]] = []
+        self._confirmation_lock = threading.RLock()
+        self._confirmation_sequence = 0
+        self._pending_confirmations: dict[int, _PendingSendConfirmation] = {}
 
     # --- 公共接口 ---
 
@@ -134,6 +169,7 @@ class MessageMonitor:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        self._cancel_all_send_confirmations()
         self._stop_event = None
         logger.info("消息监听器已停止")
         self._log_stats()
@@ -179,6 +215,79 @@ class MessageMonitor:
         self._sent_messages.append((str(receiver), normalized, time.monotonic()))
         self._cleanup_sent_messages()
 
+    def register_send_confirmation(
+        self,
+        target_id: str,
+        content: str,
+        since_ts: int,
+        timeout: float,
+    ) -> SendConfirmationHandle:
+        """发送前登记一次精确回读，不创建第二个数据库读取器。"""
+        normalized = self._normalize_confirmation_content(content)
+        target = str(target_id or "").strip()
+        if not self._running:
+            raise RuntimeError("消息监听器未运行，无法安全确认发送结果")
+        if not target or not normalized:
+            raise RuntimeError("发送确认缺少目标会话或消息正文")
+
+        with self._confirmation_lock:
+            self._confirmation_sequence += 1
+            pending = _PendingSendConfirmation(
+                confirmation_id=self._confirmation_sequence,
+                target_id=target,
+                normalized_content=normalized,
+                since_ts=int(since_ts),
+                until_ts=int(time.time() + max(float(timeout), 0.0) + 5),
+            )
+            self._pending_confirmations[pending.confirmation_id] = pending
+        return SendConfirmationHandle(self, pending)
+
+    def _cancel_send_confirmation(self, confirmation_id: int) -> None:
+        with self._confirmation_lock:
+            pending = self._pending_confirmations.pop(int(confirmation_id), None)
+            if pending is not None:
+                pending.event.set()
+
+    def _cancel_all_send_confirmations(self) -> None:
+        with self._confirmation_lock:
+            pending = list(self._pending_confirmations.values())
+            self._pending_confirmations.clear()
+        for item in pending:
+            item.event.set()
+
+    def _notify_send_confirmations(self, msg: WeChatMessage) -> None:
+        """用监听器已经查询到的本人消息唤醒精确匹配的发送等待器。"""
+        if not getattr(msg, "is_self", False) or msg.msg_type != MSG_TYPE_TEXT:
+            return
+        target_id = msg.room_id if msg.is_group else msg.sender
+        normalized = self._normalize_confirmation_content(msg.content)
+        if not target_id or not normalized:
+            return
+        try:
+            msg_ts = int(msg.create_time.timestamp())
+        except Exception:
+            return
+        now_ts = int(time.time())
+        if msg_ts > now_ts + 5:
+            return
+
+        matched: list[_PendingSendConfirmation] = []
+        expired: list[_PendingSendConfirmation] = []
+        with self._confirmation_lock:
+            for confirmation_id, pending in list(self._pending_confirmations.items()):
+                if pending.until_ts < now_ts:
+                    expired.append(self._pending_confirmations.pop(confirmation_id))
+                    continue
+                if (
+                    pending.target_id == str(target_id)
+                    and pending.normalized_content == normalized
+                    and pending.since_ts <= msg_ts <= pending.until_ts
+                ):
+                    pending.matched = True
+                    matched.append(self._pending_confirmations.pop(confirmation_id))
+        for pending in expired + matched:
+            pending.event.set()
+
     # --- 内部轮询逻辑 ---
 
     async def _poll_loop(self) -> None:
@@ -191,6 +300,7 @@ class MessageMonitor:
             try:
                 messages = await self._poll_once()
                 for msg in messages:
+                    self._notify_send_confirmations(msg)
                     if self._should_process(msg):
                         try:
                             self._queue.put_nowait(msg)
@@ -328,6 +438,24 @@ class MessageMonitor:
     def _normalize_content(content: str) -> str:
         """统一消息文本用于去重匹配。"""
         return str(content or "").strip()
+
+    @staticmethod
+    def _normalize_confirmation_content(content: str) -> str:
+        """统一发送回读正文，兼容群聊发送者前缀和零宽字符。"""
+        normalized = str(content or "").replace("\r\n", "\n").replace("\r", "\n")
+        normalized = re.sub(
+            r"^\s*(?:(?:wxid|gh)_[a-z0-9_-]+|\d+@openim)\s*:\s*(?:\n|$)",
+            "",
+            normalized,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        normalized = "".join(
+            character
+            for character in normalized
+            if character not in "\u200b\u200c\u200d\ufeff"
+        )
+        return " ".join(normalized.split())
 
     def _cleanup_dedup(self) -> None:
         """清理过期的去重记录。"""

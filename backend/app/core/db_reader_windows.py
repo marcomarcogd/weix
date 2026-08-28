@@ -100,6 +100,8 @@ class WindowsDBReader(BaseDBReader):
         ] = None
         self._current_sender_id: Optional[int] = None
         self._direction_warning_logged: bool = False
+        self._full_refresh_retry_after: float = 0.0
+        self._full_refresh_backoff_seconds: float = 5.0
 
     # --- 公共接口 ---
 
@@ -145,6 +147,7 @@ class WindowsDBReader(BaseDBReader):
                 self._wal_signature,
             ) = self._build_full_snapshot()
             self._last_refresh = time.monotonic()
+            self._full_refresh_retry_after = 0.0
             logger.info("数据库打开成功")
             return True
         except Exception as exc:
@@ -163,6 +166,8 @@ class WindowsDBReader(BaseDBReader):
         """
         if not self._db_path or not self._key:
             return False
+        started = time.perf_counter()
+        refresh_reason = "unchanged"
         try:
             with self._lock:
                 source_signature = self._file_signature(self._db_path)
@@ -176,12 +181,38 @@ class WindowsDBReader(BaseDBReader):
                     return True
 
                 if source_signature != self._source_signature:
-                    self._replace_with_full_snapshot_locked()
+                    refresh_reason = "checkpoint"
+                    now = time.monotonic()
+                    if now < self._full_refresh_retry_after:
+                        logger.debug(
+                            "微信主库 checkpoint 重建处于退避期，保留上一份可读快照"
+                        )
+                        return False
+                    try:
+                        self._replace_with_full_snapshot_locked(reason=refresh_reason)
+                    except Exception:
+                        self._full_refresh_retry_after = (
+                            time.monotonic() + self._full_refresh_backoff_seconds
+                        )
+                        raise
                 else:
+                    refresh_reason = "wal"
                     self._refresh_from_wal_locked()
+                self._full_refresh_retry_after = 0.0
                 self._last_refresh = time.monotonic()
+            elapsed = time.perf_counter() - started
+            if elapsed >= 1.0:
+                logger.info(
+                    "数据库刷新耗时较长: reason=%s, elapsed=%.3fs",
+                    refresh_reason,
+                    elapsed,
+                )
             return True
         except Exception as exc:
+            self._full_refresh_retry_after = max(
+                self._full_refresh_retry_after,
+                time.monotonic() + self._full_refresh_backoff_seconds,
+            )
             logger.error(f"刷新数据库副本失败: {exc}")
             return False
 
@@ -1226,7 +1257,8 @@ class WindowsDBReader(BaseDBReader):
             raise
         return decrypted_path, conn, source_signature, wal_signature
 
-    def _replace_with_full_snapshot_locked(self) -> None:
+    def _replace_with_full_snapshot_locked(self, reason: str = "checkpoint") -> None:
+        started = time.perf_counter()
         old_path = self._decrypted_path
         old_conn = self._sqlite_conn
         new_path, new_conn, source_signature, wal_signature = (
@@ -1249,6 +1281,11 @@ class WindowsDBReader(BaseDBReader):
                 os.unlink(old_path)
             except OSError:
                 pass
+        logger.info(
+            "完整快照重建完成: reason=%s, elapsed=%.3fs",
+            reason,
+            time.perf_counter() - started,
+        )
 
     def _read_wal_snapshot(self) -> tuple[Optional[tuple[int, int]], bytes]:
         """读取一次稳定的 WAL 内容；微信写入期间发生变化则留到下一轮。"""

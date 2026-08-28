@@ -117,6 +117,8 @@ class AutoReplyPipeline:
         # 5. 启动消息监控。回看 5 分钟，避免启动/重启过程漏掉刚收到的消息。
         self._monitor = MessageMonitor(msg_reader)
         await self._monitor.start(lookback_seconds=300.0)
+        if hasattr(self._sender, "set_confirmation_source"):
+            self._sender.set_confirmation_source(self._monitor)
 
         # 6. 加载规则引擎 (先从 YAML 同步到 DB)
         from app.workflow.rule_engine import RuleEngine
@@ -167,6 +169,8 @@ class AutoReplyPipeline:
         self._group_rule_last_trigger_at.clear()
         if self._monitor:
             await self._monitor.stop()
+        if self._sender and hasattr(self._sender, "set_confirmation_source"):
+            self._sender.set_confirmation_source(None)
         logger.info("自动回复流水线已停止")
 
     # ------------------------------------------------------------------

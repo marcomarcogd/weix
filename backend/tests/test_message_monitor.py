@@ -2,6 +2,7 @@ import os
 import sys
 import asyncio
 import threading
+import time
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -147,3 +148,79 @@ async def test_stop_waits_for_active_poll_executor_to_finish():
 
     release.set()
     await asyncio.wait_for(stop_task, timeout=1.0)
+
+
+def test_send_confirmation_matches_self_target_content_and_time():
+    monitor = _monitor()
+    monitor._running = True
+    now = int(time.time())
+    handle = monitor.register_send_confirmation(
+        "room@chatroom",
+        "收到",
+        now - 2,
+        5.0,
+    )
+    msg = WeChatMessage(
+        msg_id="self:group:1",
+        msg_type=1,
+        content="wxid_friend:\n收到\u200b",
+        sender="wxid_self",
+        room_id="room@chatroom",
+        create_time=datetime.fromtimestamp(now),
+        is_group=True,
+        is_self=True,
+    )
+
+    monitor._notify_send_confirmations(msg)
+
+    assert handle.wait(0) is True
+
+
+def test_send_confirmation_rejects_peer_wrong_target_and_stale_messages():
+    monitor = _monitor()
+    monitor._running = True
+    now = int(time.time())
+    handle = monitor.register_send_confirmation(
+        "room@chatroom",
+        "只允许精确匹配",
+        now - 2,
+        5.0,
+    )
+
+    wrong_messages = [
+        WeChatMessage(
+            msg_id="peer",
+            msg_type=1,
+            content="只允许精确匹配",
+            sender="wxid_peer",
+            room_id="room@chatroom",
+            create_time=datetime.fromtimestamp(now),
+            is_group=True,
+            is_self=False,
+        ),
+        WeChatMessage(
+            msg_id="wrong-room",
+            msg_type=1,
+            content="只允许精确匹配",
+            sender="wxid_self",
+            room_id="other@chatroom",
+            create_time=datetime.fromtimestamp(now),
+            is_group=True,
+            is_self=True,
+        ),
+        WeChatMessage(
+            msg_id="stale",
+            msg_type=1,
+            content="只允许精确匹配",
+            sender="wxid_self",
+            room_id="room@chatroom",
+            create_time=datetime.fromtimestamp(now - 60),
+            is_group=True,
+            is_self=True,
+        ),
+    ]
+    for msg in wrong_messages:
+        monitor._notify_send_confirmations(msg)
+
+    assert handle.wait(0) is False
+    handle.cancel()

@@ -5,7 +5,6 @@
 """
 
 import os
-import sqlite3
 import sys
 import threading
 import time
@@ -48,6 +47,7 @@ class FakeWindow:
 def _make_sender():
     """创建带 mock 窗口的 WindowsSender。"""
     from app.core.sender_windows import WindowsSender
+    from app.core.windows_sender_calibration import ClientGeometry, default_calibration
 
     sender = WindowsSender()
     sender._window_activate_delay = 0
@@ -55,6 +55,15 @@ def _make_sender():
     sender._type_delay = 0
     sender._skip_search_ttl = 60
     sender._verify_after_send = False
+    sender._calibration = default_calibration("test", confirmed=True)
+    sender._assert_calibration_ready = MagicMock()
+    sender._get_active_client_geometry = MagicMock(
+        return_value=ClientGeometry(0, 0, 1200, 800, 96)
+    )
+    sender._wechat_popup_windows = MagicMock(return_value={})
+    sender._wait_for_new_wechat_popup = MagicMock(
+        return_value=(100, 200, 160, 120)
+    )
     return sender
 
 
@@ -203,6 +212,9 @@ def test_unconfirmed_send_is_never_retried():
     sender._paste_text = MagicMock()
     sender._click_send_button = MagicMock()
     sender._verify_sent_text = MagicMock(return_value=False)
+    sender._confirmation_is_available = MagicMock(return_value=True)
+    confirmation = MagicMock()
+    sender._begin_send_confirmation = MagicMock(return_value=confirmation)
 
     ok = sender._send_text_sync(
         "只发一次",
@@ -216,6 +228,7 @@ def test_unconfirmed_send_is_never_retried():
     sender._click_send_button.assert_called_once_with()
     sender._full_search.assert_not_called()
     assert sender._last_receiver == ""
+    confirmation.cancel.assert_called_once_with()
 
 
 def test_activate_wechat_aborts_when_foreground_cannot_be_obtained():
@@ -300,6 +313,9 @@ def test_send_action_exception_is_never_retried():
     sender._paste_text = MagicMock()
     sender._click_send_button = MagicMock(side_effect=RuntimeError("点击结果未知"))
     sender._verify_sent_text = MagicMock()
+    sender._confirmation_is_available = MagicMock(return_value=True)
+    confirmation = MagicMock()
+    sender._begin_send_confirmation = MagicMock(return_value=confirmation)
 
     ok = sender._send_text_sync(
         "不能补发",
@@ -314,6 +330,7 @@ def test_send_action_exception_is_never_retried():
     sender._verify_sent_text.assert_not_called()
     sender._full_search.assert_not_called()
     assert sender._last_receiver == ""
+    confirmation.cancel.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -466,142 +483,94 @@ def test_ensure_window_visible_moves_offscreen_window():
     assert args[3] == 47
 
 
-def test_reader_has_recent_self_text_requires_target_v4_table():
-    from app.core.sender_windows import WindowsSender
-
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    conn.execute(
-        "CREATE TABLE Msg_group (local_id INTEGER, create_time INTEGER, real_sender_id INTEGER, "
-        "message_content TEXT, local_type INTEGER, status INTEGER, origin_source INTEGER, server_seq INTEGER)"
-    )
-    conn.execute(
-        "CREATE TABLE Msg_private (local_id INTEGER, create_time INTEGER, real_sender_id INTEGER, "
-        "message_content TEXT, local_type INTEGER, status INTEGER, origin_source INTEGER, server_seq INTEGER)"
-    )
-    conn.execute(
-        "INSERT INTO Msg_private VALUES (1, 100, 1, '发错窗口了', 1, 3, 0, 10)"
+def test_client_coordinate_resolution_uses_client_origin_and_anchors():
+    from app.core.windows_sender_calibration import (
+        ClientGeometry,
+        default_calibration,
+        resolve_point,
     )
 
-    class Reader:
-        _sqlite_conn = conn
+    profile = default_calibration("4.1.13.12", confirmed=True)
+    geometry = ClientGeometry(left=110, top=80, width=1200, height=800, dpi=96)
 
-        def _has_msg_shard_tables(self):
-            return True
+    assert resolve_point(profile, "search_input", geometry) == (283, 129)
+    assert resolve_point(profile, "message_input", geometry) == (710, 784)
+    assert resolve_point(profile, "send_button", geometry) == (1238, 840)
 
-        def _get_v4_msg_tables(self):
-            return [
-                ("Msg_group", "room@chatroom"),
-                ("Msg_private", "wxid_friend"),
-            ]
 
-        def _is_self_sent_v4_row(self, row):
-            return True
+def test_fixed_client_offsets_scale_with_window_dpi():
+    from app.core.windows_sender_calibration import (
+        ClientGeometry,
+        default_calibration,
+        resolve_point,
+    )
 
-        def _decode_message_content(self, content):
-            return str(content or "")
+    profile = default_calibration("4.1.13.12", confirmed=True)
+    geometry = ClientGeometry(left=20, top=30, width=1500, height=900, dpi=144)
 
-    assert (
-        WindowsSender._reader_has_recent_self_text(
-            Reader(),
-            "发错窗口了",
-            90,
-            target_id="room@chatroom",
+    assert resolve_point(profile, "search_input", geometry) == (280, 104)
+    assert resolve_point(profile, "send_button", geometry) == (1412, 870)
+
+
+def test_calibration_rejects_point_outside_expected_region():
+    from app.core.windows_sender_calibration import (
+        ClientGeometry,
+        default_calibration,
+        resolve_point,
+    )
+
+    profile = default_calibration("4.1.13.12", confirmed=True)
+    profile["points"]["group_search_result"]["x"] = 700
+
+    with pytest.raises(RuntimeError, match="不在预期区域"):
+        resolve_point(
+            profile,
+            "group_search_result",
+            ClientGeometry(0, 0, 1200, 800, 96),
         )
-        is False
-    )
-    assert (
-        WindowsSender._reader_has_recent_self_text(
-            Reader(),
-            "发错窗口了",
-            90,
-            target_id="wxid_friend",
-        )
-        is True
+
+
+def test_calibration_requires_same_wechat_version():
+    from app.core.windows_sender_calibration import (
+        calibration_is_compatible,
+        default_calibration,
     )
 
+    profile = default_calibration("4.1.13.12", confirmed=True)
 
-def test_reader_has_recent_self_text_rejects_missing_target_id():
-    from app.core.sender_windows import WindowsSender
-
-    class Reader:
-        _sqlite_conn = object()
-
-        def _has_msg_shard_tables(self):
-            raise AssertionError("缺少目标会话时不应扫描任何消息表")
-
-    assert WindowsSender._reader_has_recent_self_text(Reader(), "消息", 1) is False
+    compatible, reason = calibration_is_compatible(profile, "4.2.0.0")
+    assert compatible is False
+    assert "重新校准" in reason
 
 
-def test_reader_has_recent_self_text_normalizes_group_prefix():
-    from app.core.sender_windows import WindowsSender
+def test_verification_source_missing_aborts_before_any_click():
+    sender = _make_sender()
+    sender._verify_after_send = True
+    sender._confirmation_source = None
+    sender._find_wechat_window = MagicMock()
 
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    conn.execute(
-        "CREATE TABLE Msg_group (local_id INTEGER, create_time INTEGER, real_sender_id INTEGER, "
-        "message_content TEXT, local_type INTEGER, status INTEGER, origin_source INTEGER, server_seq INTEGER)"
-    )
-    conn.execute(
-        "INSERT INTO Msg_group VALUES (1, ?, 1, ?, 1, 3, 0, 10)",
-        (int(time.time()), "wxid_friend:\n收到\u200b"),
+    ok = sender._send_text_sync(
+        "不能发送",
+        "测试联系人",
+        force_skip=False,
+        is_group=False,
+        target_id="wxid_target",
     )
 
-    class Reader:
-        _sqlite_conn = conn
-
-        def _has_msg_shard_tables(self):
-            return True
-
-        def _get_v4_msg_tables(self):
-            return [("Msg_group", "room@chatroom")]
-
-        def _is_self_sent_v4_row(self, _row):
-            return True
-
-        def _decode_message_content(self, content):
-            return str(content or "")
-
-    assert WindowsSender._reader_has_recent_self_text(
-        Reader(),
-        "收到",
-        int(time.time()) - 2,
-        target_id="room@chatroom",
-    ) is True
+    assert ok is False
+    sender._find_wechat_window.assert_not_called()
+    pyautogui.rightClick.assert_not_called()
+    pyautogui.click.assert_not_called()
 
 
-def test_reader_has_recent_self_text_rejects_future_timestamp():
-    from app.core.sender_windows import WindowsSender
+def test_unowned_or_missing_paste_popup_aborts_before_left_click():
+    sender = _make_sender()
+    sender._active_wechat_hwnd = 123
+    sender._is_wechat_foreground = MagicMock(return_value=True)
+    sender._wait_for_new_wechat_popup = MagicMock(return_value=None)
 
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    conn.execute(
-        "CREATE TABLE Msg_group (local_id INTEGER, create_time INTEGER, real_sender_id INTEGER, "
-        "message_content TEXT, local_type INTEGER, status INTEGER, origin_source INTEGER, server_seq INTEGER)"
-    )
-    conn.execute(
-        "INSERT INTO Msg_group VALUES (1, ?, 1, '时间异常', 1, 3, 0, 10)",
-        (int(time.time()) + 3600,),
-    )
+    with pytest.raises(RuntimeError, match="未识别到属于微信"):
+        sender._paste_text_via_context_menu(600, 700)
 
-    class Reader:
-        _sqlite_conn = conn
-
-        def _has_msg_shard_tables(self):
-            return True
-
-        def _get_v4_msg_tables(self):
-            return [("Msg_group", "room@chatroom")]
-
-        def _is_self_sent_v4_row(self, _row):
-            return True
-
-        def _decode_message_content(self, content):
-            return str(content or "")
-
-    assert WindowsSender._reader_has_recent_self_text(
-        Reader(),
-        "时间异常",
-        int(time.time()) - 2,
-        target_id="room@chatroom",
-    ) is False
+    pyautogui.rightClick.assert_called_once_with(600, 700)
+    pyautogui.click.assert_not_called()
