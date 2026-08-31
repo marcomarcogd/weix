@@ -58,13 +58,22 @@ macos_sender:
 windows_sender:
   method: uia
   send_mode: auto
+  background_mode: false
   background_post_message: true
   allow_foreground_activation: true
+  allow_mouse_fallback: false
+  background_attempts: 1
+  foreground_attempts: 1
+  ensure_full_layout: true
+  send_key_fallback: none
+  send_button_key_fallback: none
+  require_ui_verify: true
+  pending_verify_retries: 2
   # 高风险可选项：写入 Weixin.dll 运行时的一个 UIA gate 字节，默认关闭。
   hot_activate_accessibility: false
   click_x_ratio: 0.5
   click_y_ratio: 0.88
-  park_after_send: true
+  park_after_send: false
   parking_receiver: 文件传输助手
   paste_method: context_menu
   search_x_offset: 173
@@ -84,7 +93,10 @@ windows_sender:
   window_activate_delay: 0.5
 
 monitor:
-  poll_interval: 0.5
+  # 兼顾及时性与数据库刷新开销；轮询按每轮开始时间计时。
+  poll_interval: 0.25
+  # 自动回复默认不回放进程启动前的旧消息，防止重启造成重复发送。
+  lookback_seconds: 0
 
 platform: auto
 

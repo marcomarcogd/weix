@@ -123,9 +123,12 @@ class AutoReplyPipeline:
         # 4. 仅回填今天的本地统计，不进入自动回复队列。
         await self._backfill_today_messages(msg_reader)
 
-        # 5. 启动消息监控。回看 5 分钟，避免启动/重启过程漏掉刚收到的消息。
+        # 5. 启动消息监控。自动发送默认不回放启动前的旧消息，避免重启后
+        # 对同一条消息重复回复；如只做观察，可在配置中显式增加回看时间。
         self._monitor = MessageMonitor(msg_reader)
-        await self._monitor.start(lookback_seconds=300.0)
+        lookback_seconds = self._monitor_lookback_seconds()
+        await self._monitor.start(lookback_seconds=lookback_seconds)
+        logger.info("消息监控启动回看窗口: %.1fs", lookback_seconds)
         if hasattr(self._sender, "set_confirmation_source"):
             self._sender.set_confirmation_source(self._monitor)
         if platform.is_windows and hasattr(self._sender, "prewarm_uia"):
@@ -194,6 +197,16 @@ class AutoReplyPipeline:
     # ------------------------------------------------------------------
     # Internal: 初始化
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _monitor_lookback_seconds() -> float:
+        """Read a non-negative startup lookback; fail closed to no replay."""
+        monitor_cfg = getattr(get_config(), "monitor", {}) or {}
+        try:
+            return max(0.0, float(monitor_cfg.get("lookback_seconds", 0.0)))
+        except (TypeError, ValueError):
+            logger.warning("monitor.lookback_seconds 配置无效，已按 0 秒处理")
+            return 0.0
 
     @staticmethod
     def _load_keys(platform) -> dict[str, str]:
@@ -779,11 +792,17 @@ class AutoReplyPipeline:
             await self._park_after_reply()
             return True
 
+        last_result = getattr(self._sender, "last_send_result", None)
         logger.error(
-            "自动回复发送失败 | receiver=%s | display_name=%s | is_group=%s",
+            "自动回复发送失败 | receiver=%s | display_name=%s | is_group=%s "
+            "| stage=%s | code=%s | action_performed=%s | draft_cleared=%s",
             receiver,
             display_name,
             msg.is_group,
+            getattr(last_result, "stage", ""),
+            getattr(last_result, "error_code", ""),
+            bool(getattr(last_result, "action_performed", False)),
+            bool(getattr(last_result, "draft_cleared", False)),
         )
         return False
 

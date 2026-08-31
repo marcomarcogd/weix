@@ -5,35 +5,134 @@
 """
 
 import asyncio
+import ctypes
+import json
 import logging
+import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
-from app.core.windows_sender_calibration import (
-    ClientGeometry,
-    calibration_is_compatible,
-    enable_per_monitor_dpi_awareness,
-    get_client_geometry,
-    get_process_file_version,
-    load_calibration,
-    resolve_point,
-)
-
-enable_per_monitor_dpi_awareness()
+from ctypes import wintypes
 
 import pyautogui
 import pyperclip
 
 from app.core.base import BaseMessageSender
+from app.core.send_result import SendResult
 from app.config import get_config
+from app.utils.paths import get_data_dir
 
 logger = logging.getLogger(__name__)
 
 # 微信窗口标题（中文/英文）
 WECHAT_WINDOW_TITLES = ["微信", "WeChat"]
 WECHAT_PROCESS_NAMES = {"weixin.exe", "wechat.exe"}
+
+
+if os.name == "nt":
+    _USER32 = ctypes.WinDLL("user32", use_last_error=True)
+    _WND_ENUM_PROC = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HWND,
+        wintypes.LPARAM,
+    )
+    _USER32.EnumWindows.argtypes = [_WND_ENUM_PROC, wintypes.LPARAM]
+    _USER32.EnumWindows.restype = wintypes.BOOL
+    _USER32.IsWindowVisible.argtypes = [wintypes.HWND]
+    _USER32.IsWindowVisible.restype = wintypes.BOOL
+    _USER32.IsIconic.argtypes = [wintypes.HWND]
+    _USER32.IsIconic.restype = wintypes.BOOL
+    _USER32.IsZoomed.argtypes = [wintypes.HWND]
+    _USER32.IsZoomed.restype = wintypes.BOOL
+    _USER32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    _USER32.GetWindowTextLengthW.restype = ctypes.c_int
+    _USER32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    _USER32.GetWindowTextW.restype = ctypes.c_int
+    _USER32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    _USER32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    _USER32.GetWindowRect.argtypes = [
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.RECT),
+    ]
+    _USER32.GetWindowRect.restype = wintypes.BOOL
+    _USER32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    _USER32.ShowWindow.restype = wintypes.BOOL
+    _USER32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    _USER32.SetForegroundWindow.restype = wintypes.BOOL
+    _USER32.SetWindowPos.argtypes = [
+        wintypes.HWND,
+        wintypes.HWND,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.UINT,
+    ]
+    _USER32.SetWindowPos.restype = wintypes.BOOL
+else:  # pragma: no cover - this module is only selected on Windows
+    _USER32 = None
+    _WND_ENUM_PROC = None
+
+
+def _window_title(hwnd: int) -> str:
+    if _USER32 is None:
+        return ""
+    length = int(_USER32.GetWindowTextLengthW(hwnd))
+    buffer = ctypes.create_unicode_buffer(max(length + 1, 256))
+    _USER32.GetWindowTextW(hwnd, buffer, len(buffer))
+    return buffer.value.strip()
+
+
+def _window_pid(hwnd: int) -> int | None:
+    if _USER32 is None:
+        return None
+    pid = wintypes.DWORD()
+    if not _USER32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)):
+        return None
+    return int(pid.value)
+
+
+def _window_rect(hwnd: int) -> tuple[int, int, int, int] | None:
+    if _USER32 is None:
+        return None
+    rect = wintypes.RECT()
+    if not _USER32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+
+
+def _activate_window(hwnd: int) -> None:
+    """Activate a window without importing pywin32."""
+    if _USER32 is None:
+        return
+    show_command = 9 if _USER32.IsIconic(hwnd) else 5  # SW_RESTORE / SW_SHOW
+    _USER32.ShowWindow(hwnd, show_command)
+    _USER32.SetForegroundWindow(hwnd)
+
+
+def _move_window(hwnd: int, left: int, top: int, width: int, height: int) -> bool:
+    if _USER32 is None:
+        return False
+    # SWP_NOZORDER | SWP_NOACTIVATE
+    return bool(_USER32.SetWindowPos(hwnd, None, left, top, width, height, 0x0004 | 0x0010))
+
+
+def _prepare_mouse_for_gui() -> None:
+    """Move the cursor away from PyAutoGUI's emergency corners before automation."""
+    try:
+        screen_width, screen_height = pyautogui.size()
+        safe_x = max(1, min(int(screen_width) - 2, int(screen_width) // 2))
+        safe_y = max(1, min(int(screen_height) - 2, int(screen_height) // 2))
+        if _USER32 is not None:
+            _USER32.SetCursorPos(safe_x, safe_y)
+    except Exception as exc:
+        logger.debug("准备微信 GUI 鼠标位置失败: %s", exc)
 
 # 单线程 executor，保证 GUI 操作严格串行
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wx-gui")
@@ -52,7 +151,7 @@ class _WindowRef:
 
     def activate(self) -> None:
         if not self.hwnd:
-            raise RuntimeError("微信窗口缺少有效句柄")
+            return
         try:
             import win32con
             import win32gui
@@ -61,18 +160,16 @@ class _WindowRef:
                 win32gui.ShowWindow(self.hwnd, win32con.SW_RESTORE)
             else:
                 win32gui.ShowWindow(self.hwnd, win32con.SW_SHOW)
-
-            # 最小化窗口的旧坐标通常位于 (-32000, -32000)，恢复后必须
-            # 重新读取真实尺寸，避免后续可见性修正使用旧坐标缩小或误点窗口。
-            left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
-            if right > left and bottom > top:
-                self.left = left
-                self.top = top
-                self.width = right - left
-                self.height = bottom - top
             win32gui.SetForegroundWindow(self.hwnd)
-        except Exception as exc:
-            raise RuntimeError("微信窗口激活失败") from exc
+            return
+        except Exception:
+            # pywin32 is not compatible with every bundled Python build.
+            # Use user32 directly so the selected account still gets focused.
+            try:
+                _activate_window(self.hwnd)
+            except Exception:
+                # The caller has a click-based fallback after activation.
+                pass
 
 
 class WindowsSender(BaseMessageSender):
@@ -91,27 +188,42 @@ class WindowsSender(BaseMessageSender):
     def __init__(self):
         config = get_config()
         win_cfg = config.windows_sender if hasattr(config, "windows_sender") else {}
-        self._send_method = str(win_cfg.get("method", "uia") or "uia").strip().lower()
+        self._method = str(win_cfg.get("method", "uia")).strip().lower()
+        self._allow_mouse_fallback = bool(win_cfg.get("allow_mouse_fallback", False))
+        self._uia_sender = None
         self._type_delay = win_cfg.get("type_delay", 0.3)
         self._window_activate_delay = win_cfg.get("window_activate_delay", 0.5)
         self._search_result_delay = win_cfg.get("search_result_delay", 2.0)
         self._skip_search_ttl = win_cfg.get("skip_search_ttl", 60)
+        self._search_x_offset = int(win_cfg.get("search_x_offset", 173))
+        self._search_y_offset = int(win_cfg.get("search_y_offset", 49))
+        self._search_clear_x_offset = int(win_cfg.get("search_clear_x_offset", 247))
+        self._search_clear_y_offset = int(win_cfg.get("search_clear_y_offset", 49))
+        self._search_result_x_offset = int(win_cfg.get("search_result_x_offset", 153))
+        self._search_result_y_offset = int(win_cfg.get("search_result_y_offset", 130))
+        self._group_search_result_x_offset = int(
+            win_cfg.get("group_search_result_x_offset", self._search_result_x_offset)
+        )
+        self._group_search_result_y_offset = int(
+            win_cfg.get("group_search_result_y_offset", self._search_y_offset + 120)
+        )
+        self._click_x_ratio = win_cfg.get("click_x_ratio", 0.5)
+        self._click_y_ratio = win_cfg.get("click_y_ratio", 0.88)
+        self._send_button_x_from_right = int(win_cfg.get("send_button_x_from_right", 72))
+        self._send_button_y_from_bottom = int(win_cfg.get("send_button_y_from_bottom", 40))
+        self._paste_menu_x_offset = int(win_cfg.get("paste_menu_x_offset", 24))
+        self._paste_menu_y_offset = int(win_cfg.get("paste_menu_y_offset", 15))
         self._context_menu_delay = float(win_cfg.get("context_menu_delay", 0.25))
         self._paste_method = str(win_cfg.get("paste_method", "context_menu"))
         self._verify_after_send = win_cfg.get("verify_after_send", True)
         self._verify_timeout = float(win_cfg.get("verify_timeout", 30.0))
+        self._verify_interval = float(win_cfg.get("verify_interval", 1.0))
         self._park_after_send = bool(win_cfg.get("park_after_send", False))
-        self._parking_receiver = str(
-            win_cfg.get("parking_receiver", "文件传输助手") or ""
-        )
-        self._calibration = load_calibration()
-        self._confirmation_source = None
-        self._uia_sender = None
-        self._last_send_result = None
+        self._parking_receiver = str(win_cfg.get("parking_receiver", "") or "")
 
         self._last_receiver = ""
         self._last_send_time: float = 0.0
-        self._active_wechat_hwnd: int | None = None
+        self._last_result: SendResult | None = None
 
     # --- 公共接口 ---
 
@@ -122,6 +234,8 @@ class WindowsSender(BaseMessageSender):
         force_skip: bool = False,
         is_group: bool = False,
         target_id: str = "",
+        attempt_id: str = "",
+        wait_for_db_verify: bool = True,
     ) -> bool:
         """发送文本消息。
 
@@ -135,22 +249,185 @@ class WindowsSender(BaseMessageSender):
         Returns:
             True 表示发送成功。
         """
-        if not msg or not receiver:
-            logger.error("消息内容或接收者为空")
-            return False
+        result = await self.send_text_result(
+            msg,
+            receiver,
+            force_skip=force_skip,
+            is_group=is_group,
+            target_id=target_id,
+            attempt_id=attempt_id,
+            wait_for_db_verify=wait_for_db_verify,
+        )
+        return result.success
 
-        # 自动回复默认只走安全 UIA。旧坐标实现仅保留给显式配置的手工兼容
-        # 场景，UIA 失败时绝不会自动回退到鼠标或固定坐标。
-        if self._send_method != "legacy_coordinates":
-            return await self._send_text_uia(
+    async def send_text_result(
+        self,
+        msg: str,
+        receiver: str,
+        force_skip: bool = False,
+        is_group: bool = False,
+        target_id: str = "",
+        attempt_id: str = "",
+        wait_for_db_verify: bool = True,
+    ) -> SendResult:
+        """Send text and retain structured delivery diagnostics."""
+        method = self._method if self._method in {"uia", "uia_only", "uia-first"} else "mouse"
+        result = SendResult.for_message(msg, target_id or receiver, method, attempt_id)
+        if not msg or not receiver:
+            result.fail("draft", "invalid_request", "消息内容或接收者为空")
+            self._last_result = result
+            return result
+
+        if self._method in {"uia", "uia_only", "uia-first"}:
+            result = await self._send_text_uia_result(
                 msg,
                 receiver,
-                is_group=is_group,
-                target_id=target_id,
+                is_group,
+                target_id,
+                attempt_id,
+                wait_for_db_verify,
+            )
+            uia_mode = str(getattr(self._uia_sender, "_send_mode", "") or "")
+            if (
+                result.success
+                or result.status == "pending_verify"
+                or result.action_performed
+                or result.draft_cleared
+                or not self._allow_mouse_fallback
+                or uia_mode == "auto"
+            ):
+                self._last_result = result
+                return result
+            logger.warning("UIA 发送失败，按配置回退鼠标发送 | receiver=%s", receiver)
+
+            result = await self._send_text_mouse_result(
+                msg,
+                receiver,
+                force_skip,
+                is_group,
+                target_id,
+                attempt_id,
+            )
+            self._last_result = result
+            return result
+
+        result = await self._send_text_mouse_result(
+            msg,
+            receiver,
+            force_skip,
+            is_group,
+            target_id,
+            attempt_id,
+        )
+        self._last_result = result
+        return result
+
+    async def verify_pending_result(
+        self,
+        result: SendResult,
+        msg: str,
+        target_id: str = "",
+        timeout: float | None = None,
+    ) -> SendResult:
+        """Continue database-only verification for a prior send attempt.
+
+        This method never touches the UI.  It exists so callers can keep a
+        ``pending_verify`` log row alive while WeChat finishes writing the
+        message database, without re-entering the send path.
+        """
+        if result.status != "pending_verify":
+            return result
+        target_id = str(target_id or result.details.get("verification_target_id", ""))
+        since_ts = int(result.details.get("db_verify_since_ts") or result.started_at)
+        if not target_id:
+            return result.pending(
+                "db_verify",
+                error_code="target_id_required",
+                error_message="数据库验证必须提供目标会话 ID，已禁止跨会话匹配",
+                db_verified=False,
             )
 
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
+        verified = await loop.run_in_executor(
+            _executor,
+            self._verify_sent_text,
+            msg,
+            since_ts,
+            target_id,
+            timeout,
+        )
+        result.db_verified = verified
+        if verified:
+            return result.sent("db_verify", db_verified=True, ui_verified=result.ui_verified)
+        return result.pending(
+            "db_verify",
+            error_code="db_not_confirmed",
+            error_message="发送动作已完成，但目标会话数据库仍未确认",
+            db_verified=False,
+            ui_verified=result.ui_verified,
+        )
+
+    @property
+    def last_result(self) -> SendResult | None:
+        return self._last_result
+
+    async def diagnose_uia(self) -> dict:
+        """Probe the selected account's UIA tree without sending."""
+        if self._uia_sender is None:
+            from app.core.sender_windows_uia import WindowsUIASender
+
+            self._uia_sender = WindowsUIASender()
+        payload = await self._uia_sender.diagnose()
+        window = payload.get("window") or {}
+        payload.update(
+            available=bool(payload.get("uia_available")),
+            main_window=bool(window),
+            reason=str(payload.get("error") or "微信 UIA 关键控件已就绪"),
+            reason_code=str(payload.get("error_code") or ""),
+            window_class=str(window.get("class_name") or ""),
+        )
+        return payload
+
+    async def prewarm_uia(self) -> dict:
+        """Compatibility hook used by the current startup pipeline."""
+        return await self.diagnose_uia()
+
+    async def activate_uia(self) -> dict:
+        """Run the configured non-foreground UIA accessibility activation."""
+        if self._uia_sender is None:
+            from app.core.sender_windows_uia import WindowsUIASender
+
+            self._uia_sender = WindowsUIASender()
+        return await self._uia_sender.activate_accessibility()
+
+    def refresh_policy(self) -> None:
+        """Reload settings saved by the current management API."""
+        cfg = get_config().windows_sender if hasattr(get_config(), "windows_sender") else {}
+        self._method = str(cfg.get("method", "uia") or "uia").strip().lower()
+        self._allow_mouse_fallback = bool(cfg.get("allow_mouse_fallback", False))
+        self._verify_after_send = bool(cfg.get("verify_after_send", True))
+        self._park_after_send = bool(cfg.get("park_after_send", False))
+        self._parking_receiver = str(cfg.get("parking_receiver", "") or "")
+        if self._uia_sender is not None:
+            self._uia_sender.refresh_send_policy()
+
+    @property
+    def last_send_result(self) -> SendResult | None:
+        """Compatibility alias for the current diagnostics and tests."""
+        return self._last_result
+
+    async def _send_text_mouse_result(
+        self,
+        msg: str,
+        receiver: str,
+        force_skip: bool,
+        is_group: bool,
+        target_id: str,
+        attempt_id: str = "",
+    ) -> SendResult:
+        result = SendResult.for_message(msg, target_id or receiver, "mouse", attempt_id)
+        loop = asyncio.get_running_loop()
+        success = await loop.run_in_executor(
             _executor,
             self._send_text_sync,
             msg,
@@ -159,6 +436,113 @@ class WindowsSender(BaseMessageSender):
             is_group,
             target_id,
         )
+        if not success:
+            return result.fail(
+                "db_verify" if self._verify_after_send else "invoke",
+                "legacy_send_failed",
+                "传统 Windows 发送流程失败",
+            )
+        result.action_performed = True
+        result.db_verified = bool(self._verify_after_send)
+        return result.sent(
+            "db_verify" if self._verify_after_send else "invoke",
+            action_performed=True,
+            db_verified=result.db_verified,
+        )
+
+    async def _send_text_uia(
+        self,
+        msg: str,
+        receiver: str,
+        is_group: bool,
+        target_id: str,
+        attempt_id: str = "",
+        wait_for_db_verify: bool = True,
+    ) -> bool:
+        result = await self._send_text_uia_result(
+            msg,
+            receiver,
+            is_group,
+            target_id,
+            attempt_id,
+            wait_for_db_verify,
+        )
+        return result.success
+
+    async def _send_text_uia_result(
+        self,
+        msg: str,
+        receiver: str,
+        is_group: bool,
+        target_id: str,
+        attempt_id: str = "",
+        wait_for_db_verify: bool = True,
+    ) -> SendResult:
+        if self._uia_sender is None:
+            from app.core.sender_windows_uia import WindowsUIASender
+
+            self._uia_sender = WindowsUIASender()
+        send_started_at = int(time.time())
+        result = await self._uia_sender.send_text_result(
+            msg,
+            receiver,
+            is_group=is_group,
+            target_id=target_id,
+            attempt_id=attempt_id,
+        )
+        result.details.setdefault("db_verify_since_ts", send_started_at)
+        result.details.setdefault("verification_target_id", str(target_id or ""))
+        if not result.success or not self._verify_after_send:
+            return result
+
+        if not wait_for_db_verify:
+            return result.pending(
+                "db_verify",
+                error_code="db_verification_deferred",
+                error_message="UIA 已完成发送，数据库验证已转入后台，不阻塞发送请求",
+                db_verified=False,
+                ui_verified=result.ui_verified,
+            )
+
+        if not target_id:
+            return result.pending(
+                "db_verify",
+                error_code="target_id_required",
+                error_message="数据库验证必须提供目标会话 ID，已禁止跨会话匹配",
+                db_verified=False,
+                ui_verified=result.ui_verified,
+            )
+
+        loop = asyncio.get_running_loop()
+        verified = await loop.run_in_executor(
+            _executor,
+            self._verify_sent_text,
+            msg,
+            send_started_at,
+            target_id,
+        )
+        result.db_verified = verified
+        if verified:
+            return result.sent(
+                "db_verify",
+                db_verified=True,
+                ui_verified=result.ui_verified,
+            )
+
+        result.pending(
+            "db_verify",
+            error_code="db_not_confirmed",
+            error_message="UIA 已完成发送，但目标会话数据库暂未确认",
+            db_verified=False,
+            ui_verified=result.ui_verified,
+        )
+        if not verified:
+            logger.error(
+                "UIA 已执行发送，但数据库回读未确认 | receiver=%s | target_id=%s",
+                receiver,
+                target_id,
+            )
+        return result
 
     async def send_image(self, path: str, receiver: str) -> bool:
         logger.warning("Windows 平台暂不支持 send_image")
@@ -166,140 +550,36 @@ class WindowsSender(BaseMessageSender):
 
     async def is_wechat_running(self) -> bool:
         """检查微信进程是否在运行。"""
+        if self._method in {"uia", "uia_only", "uia-first"}:
+            if self._uia_sender is None:
+                from app.core.sender_windows_uia import WindowsUIASender
+
+                self._uia_sender = WindowsUIASender()
+            if await self._uia_sender.is_wechat_running():
+                return True
+            if not self._allow_mouse_fallback or getattr(self._uia_sender, "_send_mode", "") == "auto":
+                return False
         return self._find_wechat_window() is not None
 
     async def open_chat(self, receiver: str) -> bool:
         """打开指定聊天（用于发送后停靠）。"""
         if not receiver:
             return False
-        if self._send_method != "legacy_coordinates":
-            return await self._get_uia_sender().open_chat(receiver, is_group=False)
+        if self._method in {"uia", "uia_only", "uia-first"}:
+            if self._uia_sender is None:
+                from app.core.sender_windows_uia import WindowsUIASender
+
+                self._uia_sender = WindowsUIASender()
+            opened = await self._uia_sender.open_chat(receiver)
+            if opened or not self._allow_mouse_fallback or getattr(self._uia_sender, "_send_mode", "") == "auto":
+                return opened
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(_executor, self._open_chat_sync, receiver)
-
-    async def prewarm_uia(self) -> dict:
-        """预热 UIA；仅在显式授权配置开启时执行单字节热激活。"""
-        if self._send_method == "legacy_coordinates":
-            return {
-                "available": False,
-                "reason": "当前显式启用了旧坐标发送模式",
-            }
-        return await self._get_uia_sender().prewarm()
-
-    async def diagnose_uia(self) -> dict:
-        """只读返回账号/PID 绑定与关键 UIA 控件状态。"""
-        return await self._get_uia_sender().diagnose()
-
-    async def activate_uia(self) -> dict:
-        """执行配置中已明确授权的 UIA 单字节热激活。"""
-        if self._send_method == "legacy_coordinates":
-            return {
-                "ok": False,
-                "status": "legacy_coordinates",
-                "reason": "当前显式启用了旧坐标发送模式",
-            }
-        return await self._get_uia_sender().activate_accessibility()
-
-    def refresh_policy(self) -> None:
-        """热更新 UIA 发送策略；发送次数限制始终硬编码为一次。"""
-        cfg = get_config().windows_sender if hasattr(get_config(), "windows_sender") else {}
-        self._send_method = str(cfg.get("method", "uia") or "uia").strip().lower()
-        if self._uia_sender is not None:
-            self._uia_sender.refresh_policy()
-
-    @property
-    def last_send_result(self):
-        return self._last_send_result
-
-    def _get_uia_sender(self):
-        if self._uia_sender is None:
-            from app.core.sender_windows_uia import WindowsUIASender
-
-            self._uia_sender = WindowsUIASender()
-        return self._uia_sender
-
-    async def _send_text_uia(
-        self,
-        msg: str,
-        receiver: str,
-        *,
-        is_group: bool,
-        target_id: str,
-    ) -> bool:
-        """执行一次 UIA 动作，再由现有监听器做最终数据库确认。"""
-        if not self._confirmation_is_available(target_id):
-            return False
-
-        confirmation = self._begin_send_confirmation(
-            msg,
-            int(time.time()) - 2,
-            target_id,
-        )
-        try:
-            result = await self._get_uia_sender().send_text_result(
-                msg,
-                receiver,
-                is_group,
-                target_id,
-            )
-            self._last_send_result = result
-            if not result.action_performed:
-                logger.error(
-                    "UIA 在发送动作前停止 | receiver=%s | target_id=%s | stage=%s | code=%s | error=%s",
-                    receiver,
-                    target_id,
-                    result.stage,
-                    result.error_code,
-                    result.error_message,
-                )
-                return False
-
-            confirmed = await asyncio.to_thread(self._verify_sent_text, confirmation)
-            if not confirmed:
-                result.pending(
-                    "db_verify",
-                    "db_confirmation_timeout",
-                    "发送动作已执行但数据库未确认；为避免重复发送已停止",
-                )
-                logger.error(
-                    "UIA 发送动作已执行但数据库回读未确认，已禁止补发 "
-                    "| receiver=%s | target_id=%s | method=%s",
-                    receiver,
-                    target_id,
-                    result.method,
-                )
-                self.reset_search_state()
-                return False
-
-            result.sent(method=result.method)
-            self._remember_current_chat(receiver)
-            if self._park_after_send and self._parking_receiver and receiver != self._parking_receiver:
-                parked = await self._get_uia_sender().open_chat(
-                    self._parking_receiver,
-                    is_group=False,
-                )
-                if not parked:
-                    logger.warning("UIA 发送后停靠失败，已清空会话状态")
-                    self.reset_search_state()
-            logger.info(
-                "UIA 消息发送并回读确认成功 | receiver=%s | target_id=%s | method=%s",
-                receiver,
-                target_id,
-                result.method,
-            )
-            return True
-        finally:
-            if confirmation is not None:
-                confirmation.cancel()
 
     def reset_search_state(self) -> None:
         """清空免搜索状态。"""
         self._last_receiver = ""
         self._last_send_time = 0.0
-
-    def set_confirmation_source(self, source) -> None:
-        """注入已打开数据库的消息监听器，发送器不得自行解密数据库。"""
-        self._confirmation_source = source
 
     def _remember_current_chat(self, receiver: str) -> None:
         """记录当前停留的聊天，用于免搜索判断。"""
@@ -332,91 +612,66 @@ class WindowsSender(BaseMessageSender):
     ) -> bool:
         """同步消息发送，在全局锁内执行。"""
         with self._gui_lock:
-            skip_search = self._should_skip_search(receiver, force_skip, is_group)
+            try:
+                _prepare_mouse_for_gui()
 
-            if not self._confirmation_is_available(target_id):
-                return False
+                # 检查微信是否在运行
+                if self._find_wechat_window() is None:
+                    logger.error("未找到微信窗口")
+                    return False
 
-            while True:
-                send_action_attempted = False
-                confirmation = None
-                try:
-                    # 检查微信是否在运行
-                    if self._find_wechat_window() is None:
-                        logger.error("未找到微信窗口")
-                        return False
+                # 判断是否跳过搜索
+                skip_search = self._should_skip_search(receiver, force_skip, is_group)
 
-                    if not skip_search:
-                        self._full_search(receiver, is_group=is_group)
-                    else:
-                        logger.info("免搜索发送 | receiver=%s", receiver)
+                if not skip_search:
+                    self._full_search(receiver, is_group=is_group)
+                else:
+                    logger.info("免搜索发送 | receiver=%s", receiver)
 
-                    send_started_at = int(time.time()) - 2
-                    confirmation = self._begin_send_confirmation(
-                        msg,
-                        send_started_at,
+                send_started_at = int(time.time()) - 2
+
+                # 聚焦输入框 + 粘贴消息 + 点击发送；不使用键盘快捷键。
+                self._activate_wechat()
+                input_x, input_y = self._focus_message_input()
+                self._paste_text(msg, input_x, input_y)
+                self._click_send_button()
+
+                if not self._verify_sent_text(msg, send_started_at, target_id):
+                    logger.error(
+                        "消息发送后未在目标会话数据库中确认 | receiver=%s | target_id=%s",
+                        receiver,
                         target_id,
                     )
-
-                    # 聚焦输入框 + 粘贴消息 + 点击发送；不使用键盘快捷键。
-                    self._activate_wechat()
-                    input_x, input_y = self._focus_message_input()
-                    self._paste_text(msg, input_x, input_y)
-
-                    # 点击本身可能已经生效后才抛异常，所以必须在调用前标记。
-                    # 从这一刻开始禁止任何自动补发，避免数据库写入延迟导致重复消息。
-                    send_action_attempted = True
-                    self._click_send_button()
-
-                    if not self._verify_sent_text(confirmation):
-                        logger.error(
-                            "发送动作已执行但数据库回读未确认；为避免重复发送已停止补发 "
-                            "| receiver=%s | target_id=%s",
-                            receiver,
-                            target_id,
-                        )
-                        self.reset_search_state()
-                        return False
-
-                    self._remember_current_chat(receiver)
-                    self._park_if_needed(receiver)
-
-                    logger.info("消息发送成功 | receiver=%s", receiver)
-                    return True
-
-                except Exception as exc:
-                    self.reset_search_state()
-                    if send_action_attempted:
-                        logger.error(
-                            "发送动作可能已经执行，已禁止自动重试 "
-                            "| receiver=%s | target_id=%s | error=%s",
-                            receiver,
-                            target_id,
-                            exc,
-                        )
-                        return False
-
-                    # 仅在尚未执行发送动作时，允许免搜索路径切换为一次完整搜索。
-                    if skip_search and not force_skip:
-                        logger.warning(
-                            "免搜索在发送前失败，改用一次完整搜索 "
-                            "| receiver=%s | error=%s",
-                            receiver,
-                            exc,
-                        )
-                        skip_search = False
-                        continue
-
-                    logger.error("消息发送前失败 | receiver=%s | error=%s", receiver, exc)
                     return False
-                finally:
-                    if confirmation is not None:
-                        confirmation.cancel()
+
+                self._remember_current_chat(receiver)
+                self._park_if_needed(receiver)
+
+                logger.info("消息发送成功 | receiver=%s", receiver)
+                return True
+
+            except Exception as exc:
+                logger.error("消息发送失败: %s", exc)
+
+                # 免搜索失败时重试完整搜索
+                if skip_search and not force_skip:
+                    logger.info("免搜索失败，重试完整搜索")
+                    self.reset_search_state()
+                    return self._send_text_sync(
+                        msg,
+                        receiver,
+                        force_skip=False,
+                        is_group=is_group,
+                        target_id=target_id,
+                    )
+
+                return False
 
     def _open_chat_sync(self, receiver: str) -> bool:
         """同步打开聊天。"""
         with self._gui_lock:
             try:
+                _prepare_mouse_for_gui()
                 self._full_search(receiver, is_group=False)
                 self.reset_search_state()
                 return True
@@ -426,12 +681,27 @@ class WindowsSender(BaseMessageSender):
 
     # --- GUI 操作原语 ---
 
-    @staticmethod
-    def _find_wechat_window():
-        """查找微信主窗口。"""
-        win = WindowsSender._find_wechat_window_win32()
+    def _get_bound_pid(self) -> int | None:
+        """Return the PID selected by the Windows key extractor."""
+        try:
+            from app.core.platform import Platform
+
+            pid = Platform.get().key_extractor.bound_pid
+            return int(pid) if pid else None
+        except Exception:
+            return None
+
+    def _find_wechat_window(self):
+        """Find the selected Weixin main window."""
+        target_pid = self._get_bound_pid()
+        win = WindowsSender._find_wechat_window_win32(target_pid)
         if win is not None:
             return win
+
+        # When an account is explicitly selected, never fall back to an
+        # arbitrary same-titled window from another logged-in account.
+        if target_pid:
+            return None
 
         try:
             import pygetwindow as gw
@@ -453,36 +723,39 @@ class WindowsSender(BaseMessageSender):
             return None
 
     @staticmethod
-    def _find_wechat_window_win32():
+    def _find_wechat_window_win32(target_pid: int | None = None):
         """按进程名精确查找微信主窗口，避免误选 Weix/浏览器窗口。"""
-        try:
-            import psutil
-            import win32gui
-            import win32process
-        except Exception:
+        if _USER32 is None or _WND_ENUM_PROC is None:
             return None
+
+        import psutil
 
         matches: list[_WindowRef] = []
 
         def enum_handler(hwnd, _):
-            title = (win32gui.GetWindowText(hwnd) or "").strip()
+            if not _USER32.IsWindowVisible(hwnd):
+                return True
+            title = _window_title(hwnd)
             if title not in WECHAT_WINDOW_TITLES:
                 return True
             try:
-                _thread_id, pid = win32process.GetWindowThreadProcessId(hwnd)
+                pid = _window_pid(hwnd)
+                if not pid:
+                    return True
                 proc_name = psutil.Process(pid).name().lower()
             except Exception:
                 return True
             if proc_name not in WECHAT_PROCESS_NAMES:
                 return True
-            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            if target_pid and pid != target_pid:
+                return True
+            rect = _window_rect(hwnd)
+            if rect is None:
+                return True
+            left, top, right, bottom = rect
             width = right - left
             height = bottom - top
-            # Windows 会把最小化窗口放到 (-32000, -32000)，此时尺寸通常
-            # 只有约 160x28；关闭到托盘时主窗口则不可见但仍保留正常尺寸。
-            # 两者都是有效微信主窗口，真正发送前会自动恢复。
-            is_minimized = bool(win32gui.IsIconic(hwnd))
-            if not is_minimized and (width < 400 or height < 300):
+            if width < 400 or height < 300:
                 return True
             matches.append(
                 _WindowRef(
@@ -497,194 +770,32 @@ class WindowsSender(BaseMessageSender):
             return True
 
         try:
-            win32gui.EnumWindows(enum_handler, None)
+            callback = _WND_ENUM_PROC(enum_handler)
+            _USER32.EnumWindows(callback, 0)
         except Exception:
             return None
+        matches.sort(key=lambda item: (item.width * item.height, -int(item.hwnd or 0)), reverse=True)
         return matches[0] if matches else None
 
     def _activate_wechat(self) -> None:
-        """激活微信窗口并确认前台归属；失败时禁止继续鼠标操作。"""
+        """激活微信窗口。"""
         win = self._find_wechat_window()
         if win is None:
             raise RuntimeError("未找到微信窗口")
 
-        hwnd = self._window_hwnd(win)
-        if not hwnd:
-            raise RuntimeError("无法取得微信主窗口句柄，已中止本次 GUI 操作")
-
-        self._active_wechat_hwnd = None
-        last_error: Exception | None = None
-        for attempt in range(1, 4):
-            try:
-                win.activate()
-            except Exception as exc:
-                last_error = exc
-                logger.debug("微信窗口常规激活失败（第 %d 次）: %s", attempt, exc)
-
-            win = self._ensure_window_visible(win)
-            if self._is_wechat_foreground(hwnd):
-                time.sleep(max(float(self._window_activate_delay), 0.0))
-                if self._is_wechat_foreground(hwnd):
-                    self._active_wechat_hwnd = hwnd
-                    self._assert_calibration_ready(hwnd)
-                    return
-
-            try:
-                self._request_wechat_foreground(hwnd)
-            except Exception as exc:
-                last_error = exc
-                logger.debug("微信窗口前台请求失败（第 %d 次）: %s", attempt, exc)
-
-            time.sleep(max(float(self._window_activate_delay), 0.05))
-            if self._is_wechat_foreground(hwnd):
-                self._active_wechat_hwnd = hwnd
-                self._assert_calibration_ready(hwnd)
-                return
-
-        logger.error(
-            "微信窗口未能切换到前台，已中止本次 GUI 操作 | hwnd=%s | error=%s",
-            hwnd,
-            last_error or "foreground verification failed",
-        )
-        raise RuntimeError("微信窗口未成功切换到前台，已中止本次发送")
-
-    def _assert_calibration_ready(self, hwnd: int) -> None:
-        """真实点击前必须确认本机坐标和当前微信版本完全匹配。"""
-        current_version = get_process_file_version(hwnd)
-        compatible, reason = calibration_is_compatible(
-            self._calibration,
-            current_version,
-        )
-        if compatible:
-            return
-        self._active_wechat_hwnd = None
-        logger.error("微信点击校准不可用，已停止 GUI 操作: %s", reason)
-        raise RuntimeError(f"{reason}；请先在 Weix 管理器中完成微信点击校准")
-
-    @staticmethod
-    def _window_hwnd(win) -> int | None:
-        """兼容 Win32 与 pygetwindow 窗口对象的句柄字段。"""
-        hwnd = getattr(win, "hwnd", None) or getattr(win, "_hWnd", None)
         try:
-            return int(hwnd) if hwnd else None
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _is_wechat_foreground(hwnd: int) -> bool:
-        """仅接受微信主窗口或其所属弹出窗口处于前台。"""
-        try:
-            import win32con
-            import win32gui
-            import win32process
-
-            foreground = int(win32gui.GetForegroundWindow() or 0)
-            if not foreground:
-                return False
-            if foreground == int(hwnd):
-                return True
-            root_owner = int(
-                win32gui.GetAncestor(foreground, win32con.GA_ROOTOWNER) or 0
-            )
-            if root_owner == int(hwnd):
-                return True
-            _main_thread, main_pid = win32process.GetWindowThreadProcessId(hwnd)
-            _foreground_thread, foreground_pid = (
-                win32process.GetWindowThreadProcessId(foreground)
-            )
-            return bool(main_pid and foreground_pid == main_pid)
+            win.activate()
         except Exception:
-            return False
+            # pygetwindow.activate 某些版本不可靠，用点击任务栏兜底
+            pass
 
-    @staticmethod
-    def _request_wechat_foreground(hwnd: int) -> None:
-        """通过 Win32 线程输入关联请求前台，不发送任何键盘快捷键。"""
-        import win32api
-        import win32con
-        import win32gui
-        import win32process
-
-        if win32gui.IsIconic(hwnd):
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-        else:
-            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
-
-        current_thread = win32api.GetCurrentThreadId()
-        target_thread, _target_pid = win32process.GetWindowThreadProcessId(hwnd)
-        foreground = win32gui.GetForegroundWindow()
-        foreground_thread = 0
-        if foreground:
-            foreground_thread, _foreground_pid = (
-                win32process.GetWindowThreadProcessId(foreground)
-            )
-
-        attached_threads: list[int] = []
+        time.sleep(self._window_activate_delay)
+        win = self._ensure_window_visible(win)
         try:
-            for thread_id in (foreground_thread, target_thread):
-                if (
-                    thread_id
-                    and thread_id != current_thread
-                    and thread_id not in attached_threads
-                ):
-                    win32process.AttachThreadInput(current_thread, thread_id, True)
-                    attached_threads.append(thread_id)
-
-            win32gui.BringWindowToTop(hwnd)
-            win32gui.SetForegroundWindow(hwnd)
-            try:
-                win32gui.SetActiveWindow(hwnd)
-            except Exception:
-                # SetForegroundWindow 的结果会在调用方再次读取并严格校验。
-                pass
-        finally:
-            for thread_id in reversed(attached_threads):
-                try:
-                    win32process.AttachThreadInput(current_thread, thread_id, False)
-                except Exception:
-                    pass
-
-    def _assert_wechat_foreground(self, action: str) -> None:
-        """鼠标操作前后校验微信前台状态，焦点变化时立即失败关闭。"""
-        hwnd = self._active_wechat_hwnd
-        if hwnd and self._is_wechat_foreground(hwnd):
-            return
-        self._active_wechat_hwnd = None
-        logger.error("检测到前台焦点已离开微信，已中止 GUI 操作 | action=%s", action)
-        raise RuntimeError(f"执行{action}前微信已失去前台焦点")
-
-    def _get_active_wechat_window(self):
-        """返回已验证的同一个微信主窗口，拒绝窗口句柄漂移。"""
-        self._assert_wechat_foreground("读取微信窗口位置")
-        win = self._find_wechat_window()
-        if win is None:
-            raise RuntimeError("未找到微信窗口")
-        hwnd = self._window_hwnd(win)
-        if not hwnd or hwnd != self._active_wechat_hwnd:
-            self._active_wechat_hwnd = None
-            raise RuntimeError("微信主窗口发生变化，已中止本次 GUI 操作")
-        return win
-
-    def _get_active_client_geometry(self) -> ClientGeometry:
-        """每次点击前重新读取同一微信窗口的客户区，避免使用恢复前旧坐标。"""
-        win = self._get_active_wechat_window()
-        hwnd = self._window_hwnd(win)
-        if not hwnd:
-            raise RuntimeError("无法读取微信客户区")
-        return get_client_geometry(hwnd)
-
-    def _guarded_click(self, x: int, y: int, action: str) -> None:
-        """只允许在微信保持前台时执行一次左键点击。"""
-        self._assert_wechat_foreground(action)
-        pyautogui.click(x, y)
-        time.sleep(0.03)
-        self._assert_wechat_foreground(action)
-
-    def _guarded_right_click(self, x: int, y: int, action: str) -> None:
-        """只允许在微信保持前台时执行一次右键点击。"""
-        self._assert_wechat_foreground(action)
-        pyautogui.rightClick(x, y)
-        time.sleep(0.03)
-        self._assert_wechat_foreground(action)
+            pyautogui.click(win.left + min(40, max(10, win.width // 20)), win.top + 20)
+        except Exception:
+            pass
+        time.sleep(0.1)
 
     def _ensure_window_visible(self, win):
         """把非最大化微信窗口挪回屏幕内，避免发送按钮位于屏幕外。"""
@@ -692,12 +803,8 @@ class WindowsSender(BaseMessageSender):
         if not hwnd:
             return win
         try:
-            import win32con
-            import win32gui
-
             screen_w, screen_h = pyautogui.size()
-            _flags, show_cmd, *_rest = win32gui.GetWindowPlacement(hwnd)
-            if show_cmd == win32con.SW_SHOWMAXIMIZED:
+            if _USER32 is not None and _USER32.IsZoomed(hwnd):
                 return win
             if win.width >= screen_w or win.height >= screen_h:
                 return win
@@ -708,15 +815,31 @@ class WindowsSender(BaseMessageSender):
             if new_left == win.left and new_top == win.top:
                 return win
 
-            win32gui.SetWindowPos(
-                hwnd,
-                None,
-                int(new_left),
-                int(new_top),
-                int(win.width),
-                int(win.height),
-                win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE,
-            )
+            moved = False
+            try:
+                import win32con
+                import win32gui
+
+                win32gui.SetWindowPos(
+                    hwnd,
+                    None,
+                    int(new_left),
+                    int(new_top),
+                    int(win.width),
+                    int(win.height),
+                    win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE,
+                )
+                moved = True
+            except Exception:
+                moved = _move_window(
+                    hwnd,
+                    int(new_left),
+                    int(new_top),
+                    int(win.width),
+                    int(win.height),
+                )
+            if not moved:
+                return win
             time.sleep(0.2)
             refreshed = self._find_wechat_window()
             return refreshed or win
@@ -744,203 +867,297 @@ class WindowsSender(BaseMessageSender):
 
     def _focus_search_input(self) -> tuple[int, int]:
         """点击微信左侧搜索框。"""
-        x, y = self._calibrated_point("search_input")
-        self._guarded_click(x, y, "聚焦微信搜索框")
+        x, y = self._window_offset_point(self._search_x_offset, self._search_y_offset)
+        pyautogui.click(x, y)
         time.sleep(0.15)
         return x, y
 
     def _clear_search_input(self) -> None:
         """点击搜索框右侧清空按钮；搜索为空时该点击无副作用。"""
-        x, y = self._calibrated_point("search_clear")
-        self._guarded_click(x, y, "清空微信搜索框")
+        x, y = self._window_offset_point(
+            self._search_clear_x_offset,
+            self._search_clear_y_offset,
+        )
+        pyautogui.click(x, y)
         time.sleep(0.15)
 
     def _click_first_search_result(self) -> None:
         """点击搜索结果第一项。"""
-        x, y = self._calibrated_point("private_search_result")
-        self._guarded_click(x, y, "选择微信搜索结果")
+        x, y = self._window_offset_point(
+            self._search_result_x_offset,
+            self._search_result_y_offset,
+        )
+        pyautogui.click(x, y)
         time.sleep(0.15)
 
     def _click_group_search_result(self) -> None:
         """点击“群聊”分区里的搜索结果，避开顶部“搜索网络结果”。"""
-        x, y = self._calibrated_point("group_search_result")
-        self._guarded_click(x, y, "选择微信群聊搜索结果")
+        x, y = self._window_offset_point(
+            self._group_search_result_x_offset,
+            self._group_search_result_y_offset,
+        )
+        pyautogui.click(x, y)
         time.sleep(0.15)
 
     def _focus_message_input(self) -> tuple[int, int]:
         """点击消息输入区域，确保光标在输入框内。"""
-        x, y = self._calibrated_point("message_input")
+        win = self._find_wechat_window()
+        if win is None:
+            raise RuntimeError("未找到微信窗口")
 
-        self._guarded_click(x, y, "聚焦微信消息输入框")
+        try:
+            x = win.left + int(win.width * self._click_x_ratio)
+            y = win.top + int(win.height * self._click_y_ratio)
+        except AttributeError:
+            # pyautogui 回退
+            x, y = pyautogui.size()
+            x = int(x * self._click_x_ratio)
+            y = int(y * self._click_y_ratio)
+
+        pyautogui.click(x, y)
         time.sleep(0.15)
-        self._guarded_click(x, y, "再次聚焦微信消息输入框")
+        pyautogui.click(x, y)  # 双击确保焦点
         time.sleep(0.1)
         return x, y
 
     def _paste_text(self, text: str, x: int, y: int) -> None:
         """粘贴文本，不使用 Ctrl+V。"""
-        self._assert_wechat_foreground("粘贴微信文本")
         pyperclip.copy(text)
         time.sleep(0.05)
         if self._paste_method == "context_menu":
             self._paste_text_via_context_menu(x, y)
             return
-        raise RuntimeError("Windows 发送器只允许使用经校验的微信右键粘贴菜单")
+
+        win = self._find_wechat_window()
+        hwnd = getattr(win, "hwnd", None) if win else None
+        if hwnd:
+            self._post_paste_to_focused_control(hwnd)
+        time.sleep(0.3)
 
     def _paste_text_via_context_menu(self, x: int, y: int) -> None:
         """使用微信输入框右键菜单的“粘贴”，避开快捷键和 Qt 控件 WM_PASTE 限制。"""
-        before = self._wechat_popup_windows()
-        self._guarded_right_click(x, y, "打开微信粘贴菜单")
+        pyautogui.rightClick(x, y)
         time.sleep(self._context_menu_delay)
-        popup = self._wait_for_new_wechat_popup(before, (x, y))
-        if popup is None:
-            raise RuntimeError("未识别到属于微信的粘贴菜单，已停止发送")
-        popup_geometry = ClientGeometry(
-            left=popup[0],
-            top=popup[1],
-            width=popup[2],
-            height=popup[3],
-            dpi=self._get_active_client_geometry().dpi,
-        )
-        paste_x, paste_y = resolve_point(
-            self._calibration,
-            "paste_menu",
-            popup_geometry,
-        )
-        self._guarded_click(paste_x, paste_y, "点击微信粘贴菜单")
+        pyautogui.click(x + self._paste_menu_x_offset, y + self._paste_menu_y_offset)
         time.sleep(0.3)
 
-    def _click_send_button(self) -> None:
-        """点击微信输入区右下角发送按钮。"""
-        x, y = self._calibrated_point("send_button")
-        time.sleep(0.15)
-        self._guarded_click(x, y, "点击微信发送按钮")
-        time.sleep(0.3)
-
-    def _calibrated_point(self, name: str) -> tuple[int, int]:
-        """从已确认配置解析一个客户区点击点。"""
-        if self._calibration is None:
-            raise RuntimeError("未完成微信点击校准")
-        return resolve_point(
-            self._calibration,
-            name,
-            self._get_active_client_geometry(),
-        )
-
-    def _wechat_popup_windows(self) -> dict[int, tuple[int, int, int, int]]:
-        """枚举与当前微信主窗口同进程、同根所有者的可见弹窗。"""
-        hwnd = self._active_wechat_hwnd
-        if not hwnd:
-            return {}
+    @staticmethod
+    def _post_paste_to_focused_control(hwnd: int) -> None:
         try:
+            import win32api
+            import win32con
             import win32gui
             import win32process
 
-            _thread_id, main_pid = win32process.GetWindowThreadProcessId(hwnd)
-            matches: dict[int, tuple[int, int, int, int]] = {}
-
-            def enum_handler(candidate, _extra):
-                if candidate == hwnd or not win32gui.IsWindowVisible(candidate):
-                    return
-                try:
-                    _candidate_thread, candidate_pid = (
-                        win32process.GetWindowThreadProcessId(candidate)
+            fg_hwnd = win32gui.GetForegroundWindow() or hwnd
+            target_thread, _pid = win32process.GetWindowThreadProcessId(fg_hwnd)
+            current_thread = win32api.GetCurrentThreadId()
+            attached = False
+            try:
+                if target_thread != current_thread:
+                    attached = bool(
+                        win32process.AttachThreadInput(
+                            current_thread,
+                            target_thread,
+                            True,
+                        )
                     )
-                    left, top, right, bottom = win32gui.GetWindowRect(candidate)
-                except Exception:
-                    return
-                width = right - left
-                height = bottom - top
-                if (
-                    candidate_pid == main_pid
-                    and 30 <= width <= 600
-                    and 20 <= height <= 800
-                ):
-                    matches[int(candidate)] = (
-                        int(left),
-                        int(top),
-                        int(width),
-                        int(height),
+                focus_hwnd = win32gui.GetFocus() or hwnd
+            finally:
+                if attached:
+                    win32process.AttachThreadInput(
+                        current_thread,
+                        target_thread,
+                        False,
                     )
 
-            win32gui.EnumWindows(enum_handler, None)
-            return matches
+            win32gui.PostMessage(focus_hwnd, win32con.WM_PASTE, 0, 0)
         except Exception as exc:
-            logger.debug("枚举微信粘贴菜单失败: %s", exc)
-            return {}
+            logger.debug("WM_PASTE 粘贴失败: %s", exc)
 
-    def _wait_for_new_wechat_popup(
-        self,
-        before: dict[int, tuple[int, int, int, int]],
-        origin: tuple[int, int],
-    ) -> tuple[int, int, int, int] | None:
-        deadline = time.monotonic() + max(self._context_menu_delay, 0.25) + 0.5
-        while time.monotonic() <= deadline:
-            self._assert_wechat_foreground("识别微信粘贴菜单")
-            current = self._wechat_popup_windows()
-            candidates = [
-                rect
-                for hwnd, rect in current.items()
-                if hwnd not in before and self._popup_is_near_origin(rect, origin)
-            ]
-            if candidates:
-                return min(candidates, key=lambda rect: rect[2] * rect[3])
-            time.sleep(0.05)
-        return None
+    def _click_send_button(self) -> None:
+        """点击微信输入区右下角发送按钮。"""
+        win = self._find_wechat_window()
+        if win is None:
+            raise RuntimeError("未找到微信窗口")
+        x = win.left + win.width - self._send_button_x_from_right
+        y = win.top + win.height - self._send_button_y_from_bottom
+        time.sleep(0.15)
+        pyautogui.click(x, y)
+        time.sleep(0.3)
 
-    @staticmethod
-    def _popup_is_near_origin(
-        rect: tuple[int, int, int, int],
-        origin: tuple[int, int],
-    ) -> bool:
-        left, top, width, height = rect
-        right = left + width
-        bottom = top + height
-        x, y = origin
-        horizontal_distance = max(left - x, x - right, 0)
-        vertical_distance = max(top - y, y - bottom, 0)
-        return horizontal_distance <= 80 and vertical_distance <= 80
+    def _window_offset_point(self, x_offset: int, y_offset: int) -> tuple[int, int]:
+        """按微信窗口左上角固定偏移取点，适配默认窗口和最大化窗口。"""
+        win = self._find_wechat_window()
+        if win is None:
+            raise RuntimeError("未找到微信窗口")
+        x = win.left + min(max(int(x_offset), 1), max(win.width - 1, 1))
+        y = win.top + min(max(int(y_offset), 1), max(win.height - 1, 1))
+        return x, y
 
     # --- 发送后校验 ---
 
-    def _confirmation_is_available(self, target_id: str) -> bool:
-        """校验开启时，发送前必须已有同一流水线的消息监听器。"""
-        if not self._verify_after_send:
-            return True
-        if not target_id:
-            logger.error("发送回读校验缺少目标会话 ID，已在点击前停止")
-            return False
-        source = self._confirmation_source
-        if source is None or not getattr(source, "is_running", False):
-            logger.error("消息监听器未运行，已在点击前停止发送确认")
-            return False
-        if not callable(getattr(source, "register_send_confirmation", None)):
-            logger.error("消息监听器不支持发送确认，已在点击前停止")
-            return False
-        return True
-
-    def _begin_send_confirmation(
+    def _verify_sent_text(
         self,
         msg: str,
         since_ts: int,
-        target_id: str,
-    ):
-        if not self._verify_after_send:
-            return None
-        return self._confirmation_source.register_send_confirmation(
-            target_id,
-            msg,
-            since_ts,
-            self._verify_timeout,
-        )
-
-    def _verify_sent_text(self, confirmation) -> bool:
-        """等待现有消息监听器确认；不扫描、不打开、更不解密第二份数据库。"""
+        target_id: str = "",
+        timeout: float | None = None,
+    ) -> bool:
+        """发送后从本地消息库回读确认，避免 GUI 假阳性。"""
         if not self._verify_after_send:
             return True
-        if confirmation is None:
+
+        deadline = time.monotonic() + (
+            self._verify_timeout if timeout is None else max(0.0, float(timeout))
+        )
+        while time.monotonic() <= deadline:
+            try:
+                if self._find_recent_self_text(msg, since_ts, target_id):
+                    return True
+            except Exception as exc:
+                logger.debug("发送回读校验异常: %s", exc)
+            time.sleep(self._verify_interval)
+        return False
+
+    @staticmethod
+    def _find_recent_self_text(msg: str, since_ts: int, target_id: str = "") -> bool:
+        from app.core.db_reader_windows import WindowsDBReader
+
+        db_path, hex_key = WindowsSender._find_message_db_key()
+        if not db_path or not hex_key:
+            logger.warning("发送回读校验跳过: 未找到 message_0.db 密钥")
             return False
-        return bool(confirmation.wait(self._verify_timeout))
+
+        reader = WindowsDBReader()
+        try:
+            if not reader.open_db(db_path, bytes.fromhex(hex_key)):
+                return False
+            return WindowsSender._reader_has_recent_self_text(
+                reader,
+                msg,
+                since_ts,
+                target_id,
+            )
+        finally:
+            reader.close()
+
+    @staticmethod
+    def _find_message_db_key() -> tuple[str, str]:
+        from app.core.db_reader_windows import WindowsDBReader
+
+        keys_path = get_data_dir() / "all_keys.json"
+        if not keys_path.exists():
+            return "", ""
+        try:
+            keys = json.loads(keys_path.read_text(encoding="utf-8"))
+        except Exception:
+            return "", ""
+
+        for db_path in WindowsDBReader.find_database_files():
+            if os.path.basename(db_path) != "message_0.db":
+                continue
+            for key_path, hex_key in keys.items():
+                if WindowsSender._key_matches_db_path(str(key_path), db_path):
+                    return db_path, str(hex_key)
+        return "", ""
+
+    @staticmethod
+    def _key_matches_db_path(key_path: str, full_path: str) -> bool:
+        normalized_key = key_path.replace("\\", "/").lower()
+        normalized_full = full_path.replace("\\", "/").lower()
+        basename = os.path.basename(full_path)
+        if "/" in normalized_key:
+            return normalized_full.endswith(normalized_key)
+        return os.path.normcase(key_path) == os.path.normcase(basename)
+
+    @staticmethod
+    def _reader_has_recent_self_text(
+        reader,
+        msg: str,
+        since_ts: int,
+        target_id: str = "",
+    ) -> bool:
+        # 微信有时先把消息写入库，再返回 UIA 调用结果；允许少量落盘顺序偏差，
+        # 但仍然保留 target_id、本人发送标记和正文匹配，避免跨会话误判。
+        query_since_ts = max(0, int(since_ts) - 3)
+        normalized_msg = WindowsSender._normalize_text(msg)
+        if not normalized_msg or reader._sqlite_conn is None:
+            return False
+        if not target_id:
+            logger.warning("拒绝无 target_id 的发送回读校验")
+            return False
+
+        if reader._has_msg_shard_tables():
+            tables = [
+                (table, username)
+                for table, username in reader._get_v4_msg_tables()
+                if not target_id or username == target_id
+            ]
+            if target_id and not tables:
+                logger.warning("发送回读校验未找到目标会话表 | target_id=%s", target_id)
+                return False
+            for table, _username in tables:
+                try:
+                    cursor = reader._sqlite_conn.execute(
+                        f'SELECT message_content, real_sender_id, status, '
+                        f'origin_source, server_seq '
+                        f'FROM "{table}" '
+                        f'WHERE create_time >= ? AND local_type = 1 '
+                        f'ORDER BY local_id DESC LIMIT 20',
+                        (query_since_ts,),
+                    )
+                except Exception:
+                    continue
+                for row in cursor:
+                    if not reader._is_self_sent_v4_row(row):
+                        continue
+                    content = reader._decode_message_content(row["message_content"])
+                    if WindowsSender._normalize_text(content) == normalized_msg:
+                        return True
+            return False
+
+        try:
+            params: list[object] = [query_since_ts * 1000]
+            talker_filter = ""
+            if target_id:
+                talker_filter = "AND msg_talker = ?"
+                params.append(target_id)
+            cursor = reader._sqlite_conn.execute(
+                f"""
+                SELECT msg_content
+                FROM MSG
+                WHERE msg_create_time >= ?
+                  AND msg_type = 1
+                  AND is_sender = 1
+                  {talker_filter}
+                ORDER BY msg_create_time DESC
+                LIMIT 50
+                """,
+                tuple(params),
+            )
+            for row in cursor:
+                if WindowsSender._normalize_text(row["msg_content"]) == normalized_msg:
+                    return True
+        except Exception:
+            return False
+        return False
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+        normalized = re.sub(
+            r"^\s*(?:(?:wxid|gh)_[a-z0-9_-]+|\d+@openim)\s*:\s*(?:\n|$)",
+            "",
+            normalized,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        normalized = "".join(
+            character for character in normalized
+            if character not in "\u200b\u200c\u200d\ufeff"
+        )
+        return " ".join(normalized.split())
 
     # --- 内部判断 ---
 

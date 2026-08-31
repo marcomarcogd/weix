@@ -158,6 +158,25 @@ def test_display_name_reverse_index_detects_cross_type_duplicates():
     assert ambiguous == {"同名目标".casefold()}
 
 
+def test_monitor_startup_lookback_defaults_to_zero(monkeypatch):
+    monkeypatch.setattr(
+        "app.core.auto_reply_pipeline.get_config",
+        lambda: SimpleNamespace(monitor={}),
+    )
+
+    assert AutoReplyPipeline._monitor_lookback_seconds() == 0.0
+
+
+@pytest.mark.parametrize("value", [-10, "invalid", None])
+def test_monitor_startup_lookback_rejects_unsafe_values(monkeypatch, value):
+    monkeypatch.setattr(
+        "app.core.auto_reply_pipeline.get_config",
+        lambda: SimpleNamespace(monitor={"lookback_seconds": value}),
+    )
+
+    assert AutoReplyPipeline._monitor_lookback_seconds() == 0.0
+
+
 @pytest.mark.asyncio
 async def test_send_reply_refuses_ambiguous_display_name():
     sender = FakeSender()
