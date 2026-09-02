@@ -111,9 +111,9 @@ echo    2. 编辑 config\config.yaml 调整业务配置
 echo    3. 以管理员权限运行 scripts\start.bat
 echo.
 echo  Windows 注意事项:
-echo    - 发送方式: pyautogui 模拟键盘鼠标，无需额外安装
+echo    - 默认发送方式: Windows UIA，优先后台且默认不移动真实鼠标
 echo    - 密钥提取需管理员权限（读微信进程内存）
-echo    - 发送消息时微信窗口需保持前台，不要遮挡
-echo    - 关闭微信自动更新，避免 UI 变化导致坐标偏移
+echo    - 后台能力不足时会按配置停止或切换前台，不会默认使用鼠标兜底
+echo    - 微信升级后请先在管理后台重新执行 UIA 检测
 echo ============================================================
 pause
